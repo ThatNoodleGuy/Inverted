@@ -30,6 +30,10 @@ public class PlayerManager : MonoBehaviour
     [Header("Input Actions")]
     [SerializeField] private InputActionAsset actions;
 
+    [Header("Interaction")]
+    [SerializeField] private float pushForce = 2f;
+    [SerializeField] private float pushCheckDistance = 0.5f;
+
     // === Runtime Components & State ===
     private Rigidbody2D rb;
     private SpriteRenderer sr;
@@ -99,16 +103,16 @@ public class PlayerManager : MonoBehaviour
         private PlayerManager pm;
         private Vector2 input;
         public NormalState(PlayerManager pm) => this.pm = pm;
-        
+
         public void Enter()
         {
             pm.rb.gravityScale = 1;
             // Ensure normal collision with black space is disabled
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
         }
-        
+
         public void Exit() { }
-        
+
         public void HandleUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
@@ -119,8 +123,11 @@ public class PlayerManager : MonoBehaviour
                 pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, pm.jumpForce);
 
             if (pm.CanFlip() && Input.GetKeyDown(KeyCode.E)) pm.Flip();
+            
+            // Handle pushing objects
+            HandlePushInteraction();
         }
-        
+
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
@@ -129,6 +136,39 @@ public class PlayerManager : MonoBehaviour
             Vector2 normal = pm.DetectGroundNormal();
             if (pm.maintainUpright) pm.RotateToMatchNormal(normal);
             pm.sr.color = Color.Lerp(pm.sr.color, pm.normalColor, Time.deltaTime * 10f);
+        }
+
+                private void HandlePushInteraction()
+        {
+            // Determine push direction based on player facing
+            Vector2 pushDirection = pm.sr.flipX ? Vector2.left : Vector2.right;
+            
+            // Cast ray to detect objects in the black space layer
+            RaycastHit2D hit = Physics2D.Raycast(
+                pm.transform.position,
+                pushDirection,
+                pm.pushCheckDistance,
+                1 << pm.blackSpaceLayer);
+                
+            // Debug visualization
+            Debug.DrawRay(pm.transform.position, pushDirection * pm.pushCheckDistance, 
+                         hit.collider != null ? Color.green : Color.red, 0.1f);
+            
+            // If we hit something and player is pressing the push button
+            if (hit.collider != null && Input.GetKey(KeyCode.F))
+            {
+                Rigidbody2D objRb = hit.collider.GetComponent<Rigidbody2D>();
+                
+                // Check if object has Rigidbody2D and is not static
+                if (objRb != null && objRb.bodyType == RigidbodyType2D.Dynamic)
+                {
+                    // Apply force in push direction
+                    objRb.AddForce(pushDirection * pm.pushForce, ForceMode2D.Force);
+                    
+                    // Optional: Slow down player while pushing
+                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x * 0.7f, pm.rb.linearVelocity.y);
+                }
+            }
         }
     }
 
@@ -143,23 +183,23 @@ public class PlayerManager : MonoBehaviour
         public void Enter()
         {
             // Try to enter black space, return to normal state if failed
-            if (!pm.TryEnterBlackSpace()) 
+            if (!pm.TryEnterBlackSpace())
             {
                 pm.TransitionTo(pm.normalState);
                 return;
             }
-            
+
             // Important: First set upright orientation to make entry smoother
             if (pm.maintainUpright)
             {
                 float deg = Mathf.Atan2(pm.currentNormal.x, pm.currentNormal.y) * Mathf.Rad2Deg;
                 pm.transform.rotation = Quaternion.Euler(0, 0, -deg);
             }
-            
+
             // Configure physics for mirrored state - do this AFTER positioning
             pm.rb.gravityScale = -1f; // Invert gravity
             pm.rb.linearVelocity = Vector2.zero; // Reset velocity for clean transition
-            
+
             // Enable collisions with black space (we need to stand on it)
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
         }
@@ -168,15 +208,15 @@ public class PlayerManager : MonoBehaviour
         {
             // Calculate exit position using the older version's reliable method
             Vector2 exitPos = pm.FindExitPoint();
-            
+
             // Reset physics state
             pm.rb.linearVelocity = Vector2.zero;
             pm.transform.rotation = Quaternion.identity;
             pm.rb.gravityScale = 1f; // Reset to normal gravity
-            
+
             // Move to exit position
             pm.transform.position = exitPos;
-            
+
             // Reset collision
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
         }
@@ -201,7 +241,7 @@ public class PlayerManager : MonoBehaviour
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
-            
+
             // Basic horizontal movement
             pm.rb.linearVelocity = new Vector2(input.x * pm.moveSpeed, pm.rb.linearVelocity.y);
 
@@ -221,7 +261,7 @@ public class PlayerManager : MonoBehaviour
         }
     }
 
-        private bool CheckMirroredGrounded()
+    private bool CheckMirroredGrounded()
     {
         // In mirrored state, check UPWARD to see if we're standing on black space
         RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.up, 0.2f, 1 << blackSpaceLayer);
@@ -324,27 +364,27 @@ public class PlayerManager : MonoBehaviour
                 bestHit = hit;
             }
         }
-        
+
         // No black space found nearby
         if (bestDist == Mathf.Infinity) return false;
 
         // Store entry data
         entryPoint = transform.position;
         currentNormal = bestHit.normal;
-        
+
         // Move just inside black space
         transform.position = bestHit.point - currentNormal * edgeFollowDistance;
-        
+
         // Initially rotate player to match entry angle
         if (maintainUpright)
         {
             float deg = Mathf.Atan2(currentNormal.x, currentNormal.y) * Mathf.Rad2Deg;
             transform.rotation = Quaternion.Euler(0, 0, -deg);
         }
-        
+
         // Important: Ignore collisions with black space during edge following
         Physics2D.IgnoreLayerCollision(gameObject.layer, blackSpaceLayer, true);
-        
+
         return true;
     }
 
