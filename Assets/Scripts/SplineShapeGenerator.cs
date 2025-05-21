@@ -13,6 +13,7 @@ public class SplineShapeGenerator : MonoBehaviour
     [SerializeField] private float splineSamplingResolution = 0.1f;
     [SerializeField] private Material defaultMaterial;
     [SerializeField] private Color defaultColor = Color.white;
+    [SerializeField] private bool useSharedMaterial = false;
 
     // Combined SplineCreator functionality directly into this component
     [ContextMenu("Create New Square Spline")]
@@ -25,7 +26,7 @@ public class SplineShapeGenerator : MonoBehaviour
 
         // Add a SplineContainer component
         SplineContainer container = splineObj.AddComponent<SplineContainer>();
-        
+
         // Create a new spline with a simple square shape
         Spline spline = new Spline();
 
@@ -94,14 +95,26 @@ public class SplineShapeGenerator : MonoBehaviour
     [ContextMenu("Generate Spline Shapes")]
     public void GenerateSplineShapes()
     {
-        // First, remove any previously generated shapes
-        for (int i = transform.childCount - 1; i >= 0; i--)
+        // First, remove any previous mesh components from spline objects
+        SplineContainer[] containers = GetComponentsInChildren<SplineContainer>();
+        foreach (SplineContainer container in containers)
         {
-            Transform child = transform.GetChild(i);
-            if (child.name.StartsWith("SplineShape_"))
-            {
-                DestroyImmediate(child.gameObject);
-            }
+            // Remove old renderers and colliders but keep the SplineContainer
+            MeshFilter meshFilter = container.GetComponent<MeshFilter>();
+            if (meshFilter != null)
+                DestroyImmediate(meshFilter);
+
+            MeshRenderer meshRenderer = container.GetComponent<MeshRenderer>();
+            if (meshRenderer != null)
+                DestroyImmediate(meshRenderer);
+
+            PolygonCollider2D polyCollider = container.GetComponent<PolygonCollider2D>();
+            if (polyCollider != null)
+                DestroyImmediate(polyCollider);
+
+            SplineShapeColor colorComponent = container.GetComponent<SplineShapeColor>();
+            if (colorComponent != null)
+                DestroyImmediate(colorComponent);
         }
 
         // Setup Rigidbody2D
@@ -134,14 +147,14 @@ public class SplineShapeGenerator : MonoBehaviour
     {
         // Find all SplineContainer components in children
         SplineContainer[] containers = GetComponentsInChildren<SplineContainer>();
-        
+
         Debug.Log($"Found {containers.Length} SplineContainer components");
 
         foreach (SplineContainer container in containers)
         {
             // Process the spline in the container
             Spline spline = container.Spline;
-            
+
             if (spline == null)
             {
                 Debug.LogWarning($"Container {container.name} has no spline!");
@@ -151,7 +164,8 @@ public class SplineShapeGenerator : MonoBehaviour
             // Only process closed splines (open splines can't define a shape)
             if (spline.Closed)
             {
-                CreateShapeFromSpline(container.transform, spline, container.name);
+                // Add shape components directly to the spline object
+                CreateShapeOnSplineObject(container);
             }
             else
             {
@@ -160,22 +174,19 @@ public class SplineShapeGenerator : MonoBehaviour
         }
     }
 
-    private void CreateShapeFromSpline(Transform splineTransform, Spline spline, string splineName)
+    private void CreateShapeOnSplineObject(SplineContainer container)
     {
         try
         {
+            Spline spline = container.Spline;
+            Transform splineTransform = container.transform;
+            string splineName = container.name;
+
             // Calculate approximate length of the spline
             float length = SplineUtility.CalculateLength(spline, Matrix4x4.identity);
 
             // Determine number of sample points based on resolution
             int sampleCount = Mathf.Max(8, Mathf.CeilToInt(length / splineSamplingResolution));
-
-            // Create a new GameObject to hold both the renderer and collider
-            GameObject shapeObj = new GameObject($"SplineShape_{splineName}");
-            shapeObj.transform.SetParent(transform); // Parent to this object, not the spline
-            shapeObj.transform.localPosition = Vector3.zero;
-            shapeObj.transform.localRotation = Quaternion.identity;
-            shapeObj.transform.localScale = Vector3.one;
 
             // Sample the spline to get points
             Vector2[] points = new Vector2[sampleCount];
@@ -191,77 +202,83 @@ public class SplineShapeGenerator : MonoBehaviour
                 points[i] = new Vector2(localPos.x, localPos.y);
             }
 
-            // Add a polygon collider
-            PolygonCollider2D polyCollider = shapeObj.AddComponent<PolygonCollider2D>();
+            // Add a polygon collider to the spline object
+            PolygonCollider2D polyCollider = container.gameObject.AddComponent<PolygonCollider2D>();
             polyCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
             polyCollider.SetPath(0, points);
 
-            // Create a mesh from the points
-            Mesh mesh = CreateMeshFromPoints(points);
+            // Create a mesh from the collider path
+            Mesh mesh = CreateMeshFromCollider(polyCollider);
 
-            // Add MeshFilter and MeshRenderer
-            MeshFilter meshFilter = shapeObj.AddComponent<MeshFilter>();
-            meshFilter.mesh = mesh;
+            // Add MeshFilter and MeshRenderer to the spline object
+            MeshFilter meshFilter = container.gameObject.AddComponent<MeshFilter>();
+            meshFilter.sharedMesh = mesh;
 
-            MeshRenderer meshRenderer = shapeObj.AddComponent<MeshRenderer>();
-
+            MeshRenderer meshRenderer = container.gameObject.AddComponent<MeshRenderer>();
             meshRenderer.sortingLayerName = "Background"; // Create this layer in Unity
             meshRenderer.sortingOrder = -1; // Lower number = further back
 
             // Setup material
+            Material mat;
             if (defaultMaterial != null)
             {
-                meshRenderer.material = new Material(defaultMaterial);
+                mat = useSharedMaterial ? defaultMaterial : new Material(defaultMaterial);
             }
             else
             {
                 // Create a default material if none is specified
-                meshRenderer.material = new Material(Shader.Find("Sprites/Default"));
+                mat = new Material(Shader.Find("Sprites/Default"));
             }
 
             // Set the color
-            meshRenderer.material.color = defaultColor;
+            mat.color = defaultColor;
+            meshRenderer.material = mat;
 
             // Add a SplineShapeColor component to allow color customization
-            SplineShapeColor colorComponent = shapeObj.AddComponent<SplineShapeColor>();
+            SplineShapeColor colorComponent = container.gameObject.AddComponent<SplineShapeColor>();
             colorComponent.SetColor(defaultColor);
-            
-            Debug.Log($"Created shape for {splineName}");
+
+            Debug.Log($"Created shape components for {splineName}");
         }
         catch (Exception e)
         {
-            Debug.LogError($"Error creating shape from spline {splineName}: {e.Message}\n{e.StackTrace}");
+            Debug.LogError($"Error creating shape from spline {container.name}: {e.Message}\n{e.StackTrace}");
         }
     }
 
-    private Mesh CreateMeshFromPoints(Vector2[] points)
+    private Mesh CreateMeshFromCollider(PolygonCollider2D collider)
     {
+        // Get the collider path points
+        Vector2[] points = collider.GetPath(0);
+
         // Create a new mesh
         Mesh mesh = new Mesh();
 
-        // Convert 2D points to 3D vertices
+        // Create a vertex for each point
         Vector3[] vertices = new Vector3[points.Length];
         for (int i = 0; i < points.Length; i++)
         {
             vertices[i] = new Vector3(points[i].x, points[i].y, 0);
         }
 
-        // Triangulate the points to create triangles
-        // Here we use a simple approach that requires the shape to be convex
-        // For complex concave shapes, you would need a more advanced triangulation algorithm
-        int[] triangles = new int[(points.Length - 2) * 3];
-        for (int i = 0; i < points.Length - 2; i++)
-        {
-            triangles[i * 3] = 0;
-            triangles[i * 3 + 1] = i + 1;
-            triangles[i * 3 + 2] = i + 2;
-        }
+        // Create the triangles using Triangulator
+        Triangulator triangulator = new Triangulator(points);
+        int[] triangles = triangulator.Triangulate();
 
         // Calculate UVs
         Vector2[] uvs = new Vector2[vertices.Length];
+        Bounds bounds = new Bounds(vertices[0], Vector3.zero);
         for (int i = 0; i < vertices.Length; i++)
         {
-            uvs[i] = new Vector2(vertices[i].x, vertices[i].y);
+            bounds.Encapsulate(vertices[i]);
+        }
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            uvs[i] = new Vector2(
+                (vertices[i].x - bounds.min.x) / bounds.size.x,
+                (vertices[i].y - bounds.min.y) / bounds.size.y
+            );
         }
 
         // Set mesh data
@@ -307,5 +324,132 @@ public class SplineShapeColor : MonoBehaviour
         {
             meshRenderer.material.color = color;
         }
+    }
+}
+
+// Triangulator class to handle concave polygons
+public class Triangulator
+{
+    private List<Vector2> m_points = new List<Vector2>();
+
+    public Triangulator(Vector2[] points)
+    {
+        m_points = new List<Vector2>(points);
+    }
+
+    public int[] Triangulate()
+    {
+        List<int> indices = new List<int>();
+
+        int n = m_points.Count;
+        if (n < 3)
+            return indices.ToArray();
+
+        int[] V = new int[n];
+        if (Area() > 0)
+        {
+            for (int v = 0; v < n; v++)
+                V[v] = v;
+        }
+        else
+        {
+            for (int v = 0; v < n; v++)
+                V[v] = (n - 1) - v;
+        }
+
+        int nv = n;
+        int count = 2 * nv;
+        for (int v = nv - 1; nv > 2;)
+        {
+            if ((count--) <= 0)
+                return indices.ToArray();
+
+            int u = v;
+            if (nv <= u)
+                u = 0;
+
+            v = u + 1;
+            if (nv <= v)
+                v = 0;
+
+            int w = v + 1;
+            if (nv <= w)
+                w = 0;
+
+            if (Snip(u, v, w, nv, V))
+            {
+                int a, b, c, s, t;
+                a = V[u];
+                b = V[v];
+                c = V[w];
+                indices.Add(a);
+                indices.Add(b);
+                indices.Add(c);
+
+                for (s = v, t = v + 1; t < nv; s++, t++)
+                    V[s] = V[t];
+
+                nv--;
+                count = 2 * nv;
+            }
+        }
+
+        indices.Reverse();
+        return indices.ToArray();
+    }
+
+    private float Area()
+    {
+        int n = m_points.Count;
+        float A = 0.0f;
+        for (int p = n - 1, q = 0; q < n; p = q++)
+        {
+            Vector2 pval = m_points[p];
+            Vector2 qval = m_points[q];
+            A += pval.x * qval.y - qval.x * pval.y;
+        }
+        return (A * 0.5f);
+    }
+
+    private bool Snip(int u, int v, int w, int n, int[] V)
+    {
+        Vector2 A = m_points[V[u]];
+        Vector2 B = m_points[V[v]];
+        Vector2 C = m_points[V[w]];
+
+        if (Mathf.Epsilon > (((B.x - A.x) * (C.y - A.y)) - ((B.y - A.y) * (C.x - A.x))))
+            return false;
+
+        for (int p = 0; p < n; p++)
+        {
+            if ((p == u) || (p == v) || (p == w))
+                continue;
+
+            Vector2 P = m_points[V[p]];
+
+            if (InsideTriangle(A, B, C, P))
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool InsideTriangle(Vector2 A, Vector2 B, Vector2 C, Vector2 P)
+    {
+        float ax, ay, bx, by, cx, cy, apx, apy, bpx, bpy, cpx, cpy;
+        float cCROSSap, bCROSScp, aCROSSbp;
+
+        ax = C.x - B.x; ay = C.y - B.y;
+        bx = A.x - C.x; by = A.y - C.y;
+        cx = B.x - A.x; cy = B.y - A.y;
+        apx = P.x - A.x; apy = P.y - A.y;
+        bpx = P.x - B.x; bpy = P.y - B.y;
+        cpx = P.x - C.x; cpy = P.y - C.y;
+
+        aCROSSbp = ax * bpy - ay * bpx;
+        cCROSSap = cx * apy - cy * apx;
+        bCROSScp = bx * cpy - by * cpx;
+
+        return ((aCROSSbp >= 0.0f) && (bCROSScp >= 0.0f) && (cCROSSap >= 0.0f));
     }
 }
