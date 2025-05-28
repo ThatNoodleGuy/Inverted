@@ -1,0 +1,575 @@
+#pragma kernel ExternalForces
+#pragma kernel UpdateSpatialHash
+#pragma kernel Reorder
+#pragma kernel ReorderCopyback
+#pragma kernel CalculateDensities
+#pragma kernel CalculatePressureForce
+#pragma kernel CalculateViscosity
+#pragma kernel UpdatePositions
+#pragma kernel PolygonCollision
+
+static const int NumThreads = 64;
+
+// Spatial hash helper functions
+static const int2 offsets2D[9] = {
+    int2(-1, -1), int2(0, -1), int2(1, -1),
+    int2(-1,  0), int2(0,  0), int2(1,  0),
+    int2(-1,  1), int2(0,  1), int2(1,  1)
+};
+
+int2 GetCell2D(float2 position, float radius)
+{
+    return (int2)floor(position / radius);
+}
+
+uint HashCell2D(int2 cell)
+{
+    uint a = (uint)cell.x * 15823;
+    uint b = (uint)cell.y * 9737333;
+    return a + b;
+}
+
+uint KeyFromHash(uint hash, uint tableSize)
+{
+    return hash % tableSize;
+}
+
+// Smoothing kernel functions
+float SmoothingKernelPoly6(float dst, float radius)
+{
+    if (dst < radius)
+    {
+        float scale = 315.0 / (64.0 * 3.14159 * pow(radius, 9));
+        float v = radius * radius - dst * dst;
+        return v * v * v * scale;
+    }
+    return 0;
+}
+
+float SpikyKernelPow2(float dst, float radius)
+{
+    if (dst < radius)
+    {
+        float scale = 6.0 / (3.14159 * pow(radius, 4));
+        float v = radius - dst;
+        return v * v * scale;
+    }
+    return 0;
+}
+
+float SpikyKernelPow3(float dst, float radius)
+{
+    if (dst < radius)
+    {
+        float scale = 10.0 / (3.14159 * pow(radius, 5));
+        float v = radius - dst;
+        return v * v * v * scale;
+    }
+    return 0;
+}
+
+float DerivativeSpikyPow2(float dst, float radius)
+{
+    if (dst <= radius && dst > 0)
+    {
+        float scale = 12.0 / (3.14159 * pow(radius, 4));
+        float v = radius - dst;
+        return -v * scale;
+    }
+    return 0;
+}
+
+float DerivativeSpikyPow3(float dst, float radius)
+{
+    if (dst <= radius && dst > 0)
+    {
+        float scale = 30.0 / (3.14159 * pow(radius, 5));
+        float v = radius - dst;
+        return -v * v * scale;
+    }
+    return 0;
+}
+
+// Buffers
+RWStructuredBuffer<float2> Positions;
+RWStructuredBuffer<float2> PredictedPositions;
+RWStructuredBuffer<float2> Velocities;
+RWStructuredBuffer<float2> Densities;
+
+// Spatial hashing
+RWStructuredBuffer<uint> SpatialKeys;
+RWStructuredBuffer<uint> SpatialOffsets;
+StructuredBuffer<uint> SortedIndices;
+
+// Settings
+const uint numParticles;
+const float gravity;
+const float deltaTime;
+const float collisionDamping;
+const float smoothingRadius;
+const float targetDensity;
+const float pressureMultiplier;
+const float nearPressureMultiplier;
+const float viscosityStrength;
+
+// Polygon Boundary Settings
+StructuredBuffer<float2> _BoundaryPoints;
+const uint _NumBoundaryPoints;
+const float _BoundaryCollisionMargin;
+const bool _InvertBoundary;
+const float _CollisionResponseStrength;
+
+// Mouse interaction settings
+const float2 interactionInputPoint;
+const float interactionInputStrength;
+const float interactionInputRadius;
+
+// Player interaction settings - ADDED THESE!
+const float2 playerPosition;
+const float playerInteractionRadius;
+const float playerInteractionStrength;
+const float2 playerVelocity;
+const float velocityTransferStrength;
+const bool isPlayerInMirroredState;
+
+float DensityKernel(float dst, float radius)
+{
+    return SpikyKernelPow2(dst, radius);
+}
+
+float NearDensityKernel(float dst, float radius)
+{
+    return SpikyKernelPow3(dst, radius);
+}
+
+float DensityDerivative(float dst, float radius)
+{
+    return DerivativeSpikyPow2(dst, radius);
+}
+
+float NearDensityDerivative(float dst, float radius)
+{
+    return DerivativeSpikyPow3(dst, radius);
+}
+
+float ViscosityKernel(float dst, float radius)
+{
+    return SmoothingKernelPoly6(dst, smoothingRadius);
+}
+
+float2 CalculateDensity(float2 pos)
+{
+    int2 originCell = GetCell2D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float density = 0;
+    float nearDensity = 0;
+
+    for (int i = 0; i < 9; i++)
+    {
+        uint hash = HashCell2D(originCell + offsets2D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+            
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            if (neighbourKey != key) break;
+
+            float2 neighbourPos = PredictedPositions[neighbourIndex];
+            float2 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            if (sqrDstToNeighbour > sqrRadius) continue;
+
+            float dst = sqrt(sqrDstToNeighbour);
+            density += DensityKernel(dst, smoothingRadius);
+            nearDensity += NearDensityKernel(dst, smoothingRadius);
+        }
+    }
+
+    return float2(density, nearDensity);
+}
+
+float PressureFromDensity(float density)
+{
+    return (density - targetDensity) * pressureMultiplier;
+}
+
+float NearPressureFromDensity(float nearDensity)
+{
+    return nearPressureMultiplier * nearDensity;
+}
+
+// FIXED: Updated ExternalForces function to include player interaction
+float2 ExternalForces(float2 pos, float2 velocity)
+{
+    float2 gravityAccel = float2(0, gravity);
+    float2 totalAccel = gravityAccel;
+    
+    // Mouse interaction (existing code)
+    if (interactionInputStrength != 0) {
+        float2 inputPointOffset = interactionInputPoint - pos;
+        float sqrDst = dot(inputPointOffset, inputPointOffset);
+        if (sqrDst < interactionInputRadius * interactionInputRadius)
+        {
+            float dst = sqrt(sqrDst);
+            float edgeT = (dst / interactionInputRadius);
+            float centreT = 1 - edgeT;
+            float2 dirToCentre = inputPointOffset / dst;
+
+            float gravityWeight = 1 - (centreT * saturate(interactionInputStrength / 10));
+            float2 accel = gravityAccel * gravityWeight + dirToCentre * centreT * interactionInputStrength;
+            accel -= velocity * centreT;
+            return accel;
+        }
+    }
+
+    // Player interaction (NEW CODE!)
+    if (playerInteractionRadius > 0 && abs(playerInteractionStrength) > 0.001)
+    {
+        float2 playerOffset = playerPosition - pos;
+        float sqrDstToPlayer = dot(playerOffset, playerOffset);
+        float playerRadiusSqr = playerInteractionRadius * playerInteractionRadius;
+        
+        if (sqrDstToPlayer < playerRadiusSqr)
+        {
+            float dstToPlayer = sqrt(sqrDstToPlayer);
+            
+            if (dstToPlayer > 0.01) // Avoid division by zero
+            {
+                float2 dirToPlayer = playerOffset / dstToPlayer;
+                
+                // Calculate influence falloff (quadratic)
+                float influence = 1.0 - (dstToPlayer / playerInteractionRadius);
+                influence = influence * influence; // Quadratic falloff for smoother interaction
+                
+                // Apply player force (positive = attract, negative = repel)
+                float2 playerForce = dirToPlayer * playerInteractionStrength * influence;
+                
+                // Add velocity transfer from player movement
+                float2 velocityTransfer = playerVelocity * velocityTransferStrength * influence;
+                
+                // Combine forces
+                totalAccel += (playerForce + velocityTransfer);
+                
+                // Optional: Damping based on proximity for more stable interaction
+                if (dstToPlayer < playerInteractionRadius * 0.3)
+                {
+                    totalAccel -= velocity * influence * 0.5; // Light damping when very close
+                }
+            }
+            else
+            {
+                // Very close to player - apply strong repulsion to prevent clustering
+                float2 randomDir = float2(cos(pos.x * 12.345), sin(pos.y * 67.89));
+                totalAccel += normalize(randomDir) * abs(playerInteractionStrength) * 2.0;
+            }
+        }
+    }
+
+    return totalAccel;
+}
+
+// Helper function to determine if a point is inside a polygon
+bool IsPointInsidePolygon(float2 testPos)
+{
+    if (_NumBoundaryPoints < 3) return false;
+    
+    bool inside = false;
+    
+    uint j = _NumBoundaryPoints - 1;
+    for (uint i = 0; i < _NumBoundaryPoints; i++)
+    {
+        float2 pi = _BoundaryPoints[i];
+        float2 pj = _BoundaryPoints[j];
+        
+        if (((pi.y > testPos.y) != (pj.y > testPos.y)) &&
+            (testPos.x < (pj.x - pi.x) * (testPos.y - pi.y) / (pj.y - pi.y) + pi.x))
+        {
+            inside = !inside;
+        }
+        
+        j = i;
+    }
+    
+    return inside;
+}
+
+// Improved Polygon Collision Kernel
+[numthreads(NumThreads, 1, 1)]
+void PolygonCollision(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    float2 pos = Positions[id.x];
+    float2 vel = Velocities[id.x];
+
+    if (_NumBoundaryPoints < 2) return;
+
+    float minSqDist = 1.0e10;
+    float2 closestPointOnBoundary = float2(0, 0);
+    float2 boundaryNormal = float2(0, 0);
+
+    // Find closest point on polygon boundary
+    for (uint i = 0; i < _NumBoundaryPoints; i++)
+    {
+        float2 p1 = _BoundaryPoints[i];
+        float2 p2 = _BoundaryPoints[(i + 1) % _NumBoundaryPoints];
+
+        float2 segmentDir = p2 - p1;
+        float segmentLenSq = dot(segmentDir, segmentDir);
+
+        if (segmentLenSq < 0.0001f) continue;
+
+        float t = dot(pos - p1, segmentDir) / segmentLenSq;
+        t = clamp(t, 0.0f, 1.0f);
+
+        float2 pointOnSegment = p1 + t * segmentDir;
+        float2 displacement = pos - pointOnSegment;
+        float distSq = dot(displacement, displacement);
+
+        if (distSq < minSqDist)
+        {
+            minSqDist = distSq;
+            closestPointOnBoundary = pointOnSegment;
+            
+            float2 segmentNormal = float2(-segmentDir.y, segmentDir.x);
+            segmentNormal = normalize(segmentNormal);
+            
+            float2 segmentCenter = (p1 + p2) * 0.5f;
+            float2 toParticle = pos - segmentCenter;
+            
+            if (dot(segmentNormal, toParticle) < 0.0f)
+            {
+                segmentNormal = -segmentNormal;
+            }
+            
+            boundaryNormal = segmentNormal;
+        }
+    }
+
+    float dist = sqrt(minSqDist);
+    
+    bool shouldCollide = false;
+    
+    if (_InvertBoundary)
+    {
+        bool isInside = IsPointInsidePolygon(pos);
+        shouldCollide = isInside || (dist < _BoundaryCollisionMargin);
+        if (isInside)
+        {
+            boundaryNormal = -boundaryNormal;
+        }
+    }
+    else
+    {
+        bool isInside = IsPointInsidePolygon(pos);
+        shouldCollide = !isInside || (dist < _BoundaryCollisionMargin);
+        if (!isInside)
+        {
+            boundaryNormal = -boundaryNormal;
+        }
+    }
+
+    if (shouldCollide && dist < _BoundaryCollisionMargin)
+    {
+        if (dot(boundaryNormal, boundaryNormal) < 0.0001f)
+        {
+            boundaryNormal = float2(0, 1);
+        }
+        else
+        {
+            boundaryNormal = normalize(boundaryNormal);
+        }
+
+        float penetrationDepth = _BoundaryCollisionMargin - dist;
+        float positionCorrection = penetrationDepth * _CollisionResponseStrength;
+        pos += boundaryNormal * positionCorrection;
+
+        float velocityDotNormal = dot(vel, boundaryNormal);
+        if (velocityDotNormal < 0.0f)
+        {
+            vel = vel - 2.0f * velocityDotNormal * boundaryNormal;
+            vel *= collisionDamping;
+        }
+        
+        if (dist < _BoundaryCollisionMargin * 0.5f)
+        {
+            vel *= 0.8f;
+        }
+    }
+
+    Positions[id.x] = pos;
+    Velocities[id.x] = vel;
+    
+    const float predictionFactor = 1 / 120.0;
+    PredictedPositions[id.x] = pos + vel * predictionFactor;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void ExternalForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    // FIXED: Now actually calls the updated ExternalForces function
+    Velocities[id.x] += ExternalForces(Positions[id.x], Velocities[id.x]) * deltaTime;
+
+    const float predictionFactor = 1 / 120.0;
+    PredictedPositions[id.x] = Positions[id.x] + Velocities[id.x] * predictionFactor;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void UpdateSpatialHash(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    
+    uint index = id.x;
+    int2 cell = GetCell2D(PredictedPositions[index], smoothingRadius);
+    uint hash = HashCell2D(cell);
+    uint key = KeyFromHash(hash, numParticles);
+    SpatialKeys[id.x] = key;
+}
+
+RWStructuredBuffer<float2> SortTarget_Positions;
+RWStructuredBuffer<float2> SortTarget_PredictedPositions;
+RWStructuredBuffer<float2> SortTarget_Velocities;
+
+[numthreads(NumThreads, 1, 1)]
+void Reorder(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    uint sortedIndex = SortedIndices[id.x];
+    SortTarget_Positions[id.x] = Positions[sortedIndex];
+    SortTarget_PredictedPositions[id.x] = PredictedPositions[sortedIndex];
+    SortTarget_Velocities[id.x] = Velocities[sortedIndex];
+}
+
+[numthreads(NumThreads, 1, 1)]
+void ReorderCopyback(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    
+    Positions[id.x] = SortTarget_Positions[id.x];
+    PredictedPositions[id.x] = SortTarget_PredictedPositions[id.x];
+    Velocities[id.x] = SortTarget_Velocities[id.x];
+}
+
+[numthreads(NumThreads, 1, 1)]
+void CalculateDensities(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    float2 pos = PredictedPositions[id.x];
+    Densities[id.x] = CalculateDensity(pos);
+}
+
+[numthreads(NumThreads, 1, 1)]
+void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    float density = Densities[id.x][0];
+    float densityNear = Densities[id.x][1];
+    float pressure = PressureFromDensity(density);
+    float nearPressure = NearPressureFromDensity(densityNear);
+    float2 pressureForce = 0;
+    
+    float2 pos = PredictedPositions[id.x];
+    int2 originCell = GetCell2D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+    for (int i = 0; i < 9; i++)
+    {
+        uint hash = HashCell2D(originCell + offsets2D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+
+            if (neighbourIndex == id.x) continue;
+            
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            if (neighbourKey != key) break;
+            
+            float2 neighbourPos = PredictedPositions[neighbourIndex];
+            float2 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            if (sqrDstToNeighbour > sqrRadius) continue;
+
+            float dst = sqrt(sqrDstToNeighbour);
+            float2 dirToNeighbour = dst > 0 ? offsetToNeighbour / dst : float2(0, 1);
+
+            float neighbourDensity = Densities[neighbourIndex][0];
+            float neighbourNearDensity = Densities[neighbourIndex][1];
+            float neighbourPressure = PressureFromDensity(neighbourDensity);
+            float neighbourNearPressure = NearPressureFromDensity(neighbourNearDensity);
+
+            float sharedPressure = (pressure + neighbourPressure) * 0.5;
+            float sharedNearPressure = (nearPressure + neighbourNearPressure) * 0.5;
+
+            pressureForce += dirToNeighbour * DensityDerivative(dst, smoothingRadius) * sharedPressure / neighbourDensity;
+            pressureForce += dirToNeighbour * NearDensityDerivative(dst, smoothingRadius) * sharedNearPressure / neighbourNearDensity;
+        }
+    }
+
+    float2 acceleration = pressureForce / density;
+    Velocities[id.x] += acceleration * deltaTime;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void CalculateViscosity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    
+    float2 pos = PredictedPositions[id.x];
+    int2 originCell = GetCell2D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+
+    float2 viscosityForce = 0;
+    float2 velocity = Velocities[id.x];
+
+    for (int i = 0; i < 9; i++)
+    {
+        uint hash = HashCell2D(originCell + offsets2D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex;
+            currIndex++;
+
+            if (neighbourIndex == id.x) continue;
+            
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            if (neighbourKey != key) break;
+
+            float2 neighbourPos = PredictedPositions[neighbourIndex];
+            float2 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+            if (sqrDstToNeighbour > sqrRadius) continue;
+
+            float dst = sqrt(sqrDstToNeighbour);
+            float2 neighbourVelocity = Velocities[neighbourIndex];
+            viscosityForce += (neighbourVelocity - velocity) * ViscosityKernel(dst, smoothingRadius);
+        }
+    }
+    Velocities[id.x] += viscosityForce * viscosityStrength * deltaTime;
+}
+
+[numthreads(NumThreads, 1, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+
+    Positions[id.x] += Velocities[id.x] * deltaTime;
+}

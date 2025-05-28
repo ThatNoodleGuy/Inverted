@@ -4,7 +4,7 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 
 /// <summary>
-/// Optimized PlayerManager script that combines elements from both versions.
+/// Enhanced PlayerManager with automatic space-based state transitions
 /// </summary>
 [RequireComponent(typeof(Rigidbody2D), typeof(SpriteRenderer), typeof(CapsuleCollider2D))]
 public class PlayerManager : MonoBehaviour
@@ -27,12 +27,46 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private float detectionRadius = 2f;
     [SerializeField] private float edgeFollowDistance = 0.3f;
 
+    [Header("Space Detection")]
+    [SerializeField] private float spaceCheckRadius = 0.3f;
+    [SerializeField] private LayerMask normalSpaceLayer = 1; // Default layer for normal space
+    [SerializeField] private bool enableManualOverride = true;
+    [SerializeField] private float transitionSmoothTime = 0.3f;
+
+    [Header("Entry Validation")]
+    [SerializeField] private bool restrictSideEntry = true; // Prevent problematic side entries
+    [SerializeField] private bool requireGroundedForInversion = true; // Only allow inversion when grounded
+    [SerializeField] private bool preventInversionInFluid = true; // Prevent inversion when in fluid
+    [SerializeField] private float verticalEntryBias = 0.7f; // Prefer vertical entries (0.5 = no bias, 1.0 = only vertical)
+    [SerializeField] private float minimumEntryDistance = 0.2f; // Minimum distance from edge to allow entry
+    [SerializeField] private bool snapToValidPosition = true; // Snap to safe position when entering
+
     [Header("Input Actions")]
     [SerializeField] private InputActionAsset actions;
 
     [Header("Interaction")]
     [SerializeField] private float pushForce = 2f;
     [SerializeField] private float pushCheckDistance = 0.5f;
+
+    [Header("Fluid Interaction")]
+    [SerializeField] private FluidSim2D fluidSim;
+    [SerializeField] private float fluidPushRadius = 1.5f;
+    [SerializeField] private bool enableFluidInteraction = true;
+    [SerializeField] private ParticleSystem splashEffect;
+    [SerializeField] private float splashThreshold = 3f;
+
+    [Header("Fluid Movement Modifiers")]
+    [SerializeField] private float fluidMoveSpeedMultiplier = 0.7f;
+    [SerializeField] private float fluidJumpMultiplier = 1.2f;
+    [SerializeField] private bool canSwimInMirroredState = true;
+
+    // === Space Types ===
+    public enum SpaceType
+    {
+        Normal,     // Regular world space
+        BlackSpace, // Inverted/mirrored space
+        Fluid       // Water/fluid space
+    }
 
     // === Runtime Components & State ===
     private Rigidbody2D rb;
@@ -49,6 +83,21 @@ public class PlayerManager : MonoBehaviour
     private Vector2 currentNormal;
     private Vector2 entryPoint;
     private float lastFlipTime;
+    private Vector2 lastPosition;
+    private float lastSplashTime;
+
+    // Space detection
+    private SpaceType currentSpaceType;
+    private SpaceType previousSpaceType;
+    private float transitionTimer;
+    private bool isTransitioning;
+
+    // Fluid interaction tracking
+    private Vector2 velocityBuffer;
+    private bool wasInFluid;
+    private float fluidImpactForce;
+    private bool isInFluid;
+    private float timeInFluid;
 
     void Awake()
     {
@@ -64,15 +113,368 @@ public class PlayerManager : MonoBehaviour
 
         normalState = new NormalState(this);
         mirroredState = new MirroredState(this);
-        TransitionTo(normalState);
+
+        // Initialize space detection
+        currentSpaceType = DetectCurrentSpace();
+        previousSpaceType = currentSpaceType;
+
+        // Start in appropriate state based on initial space
+        TransitionTo(currentSpaceType == SpaceType.BlackSpace ? mirroredState : normalState);
+
+        lastPosition = transform.position;
+
+        // Auto-find fluid sim if not assigned
+        if (fluidSim == null)
+        {
+            fluidSim = FindFirstObjectByType<FluidSim2D>();
+        }
     }
 
     void OnEnable() => actions?.Enable();
     void OnDisable() => actions?.Disable();
 
-    void Update() => currentState.HandleUpdate();
-    void FixedUpdate() => currentState.HandleFixedUpdate();
+    void Update()
+    {
+        // Detect current space type
+        currentSpaceType = DetectCurrentSpace();
 
+        // Handle automatic state transitions
+        HandleSpaceTransitions();
+
+        currentState.HandleUpdate();
+        CheckFluidInteraction();
+    }
+
+    void FixedUpdate()
+    {
+        currentState.HandleFixedUpdate();
+        UpdateVelocityTracking();
+    }
+
+    // === Space Detection System ===
+    private SpaceType DetectCurrentSpace()
+    {
+        Vector2 playerPos = transform.position;
+
+        // Check for fluid first (highest priority)
+        if (IsInFluid())
+        {
+            return SpaceType.Fluid;
+        }
+
+        // Check if we're in black space with entry validation
+        if (IsInValidBlackSpace())
+        {
+            return SpaceType.BlackSpace;
+        }
+
+        // Default to normal space
+        return SpaceType.Normal;
+    }
+
+    private bool IsInValidBlackSpace()
+    {
+        Vector2 playerPos = transform.position;
+
+        // Basic overlap check
+        Collider2D blackSpaceCollider = Physics2D.OverlapCircle(
+            playerPos,
+            spaceCheckRadius,
+            1 << blackSpaceLayer
+        );
+
+        if (blackSpaceCollider == null)
+            return false;
+
+        // If we're already in mirrored state, allow staying in black space
+        // but check if we should exit based on grounded status
+        if (currentState == mirroredState)
+        {
+            // If we require grounded for inversion, check if we're grounded in black space
+            if (requireGroundedForInversion)
+            {
+                bool isGroundedInBlackSpace = CheckMirroredGrounded();
+
+                // Stay in black space only if we're grounded in it OR we're transitioning
+                return isGroundedInBlackSpace || isTransitioning;
+            }
+            return true;
+        }
+
+        // For new entries, always validate (this now includes grounded check)
+        return ValidateBlackSpaceEntry(playerPos);
+    }
+
+    private bool ValidateBlackSpaceEntry(Vector2 playerPos)
+    {
+        // First check if we're in fluid - prevent inversion in fluid
+        if (preventInversionInFluid && IsInFluid())
+        {
+            Debug.Log("Black space entry blocked - cannot invert while in fluid");
+            return false;
+        }
+
+        // Then check grounded requirement if enabled
+        if (requireGroundedForInversion)
+        {
+            CheckGrounded();
+            if (!isGrounded)
+            {
+                Debug.Log("Black space entry blocked - not grounded");
+                return false;
+            }
+        }
+
+        // Then check entry direction and quality if side entry restriction is enabled
+        if (restrictSideEntry)
+        {
+            EntryInfo entryInfo = FindBestEntryPoint(playerPos);
+
+            if (!entryInfo.isValid)
+                return false;
+
+            // Prefer vertical entries over side entries
+            float verticalComponent = Mathf.Abs(entryInfo.normal.y);
+            if (verticalComponent < verticalEntryBias)
+            {
+                // This is mostly a side entry, block it
+                Debug.Log("Black space entry blocked - side entry not allowed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private struct EntryInfo
+    {
+        public bool isValid;
+        public Vector2 position;
+        public Vector2 normal;
+        public float distance;
+        public float quality; // 0-1, higher is better
+    }
+
+    private EntryInfo FindBestEntryPoint(Vector2 fromPos)
+    {
+        EntryInfo bestEntry = new EntryInfo { isValid = false };
+        float bestQuality = -1f;
+
+        // Check multiple directions, prioritizing vertical
+        Vector2[] checkDirections = {
+            Vector2.down,    // Primary: down entry
+            Vector2.up,      // Secondary: up entry  
+            Vector2.left,    // Tertiary: side entries
+            Vector2.right,
+            new Vector2(-0.7f, -0.7f), // Diagonal entries
+            new Vector2(0.7f, -0.7f),
+            new Vector2(-0.7f, 0.7f),
+            new Vector2(0.7f, 0.7f)
+        };
+
+        for (int i = 0; i < checkDirections.Length; i++)
+        {
+            Vector2 dir = checkDirections[i];
+            RaycastHit2D hit = Physics2D.Raycast(fromPos, dir, detectionRadius, solidLayerMask);
+
+            if (hit.collider != null && hit.collider.gameObject.layer == blackSpaceLayer)
+            {
+                // Calculate entry quality based on direction preference and distance
+                float verticalBias = Mathf.Abs(dir.y); // Prefer vertical directions
+                float distanceQuality = 1f - (hit.distance / detectionRadius); // Prefer closer entries
+                float quality = (verticalBias * 0.7f + distanceQuality * 0.3f);
+
+                // Apply priority bonus for down direction
+                if (i == 0) quality += 0.2f; // Down gets bonus
+                else if (i == 1) quality += 0.1f; // Up gets smaller bonus
+
+                if (quality > bestQuality && hit.distance >= minimumEntryDistance)
+                {
+                    bestQuality = quality;
+                    bestEntry = new EntryInfo
+                    {
+                        isValid = true,
+                        position = hit.point - hit.normal * edgeFollowDistance,
+                        normal = hit.normal,
+                        distance = hit.distance,
+                        quality = quality
+                    };
+                }
+            }
+        }
+
+        return bestEntry;
+    }
+
+    private void HandleSpaceTransitions()
+    {
+        // If space type changed, initiate transition
+        if (currentSpaceType != previousSpaceType)
+        {
+            Debug.Log($"Space transition detected: {previousSpaceType} -> {currentSpaceType}");
+            InitiateSpaceTransition(currentSpaceType);
+            previousSpaceType = currentSpaceType;
+        }
+
+        // Handle manual override if enabled
+        if (enableManualOverride && CanFlip() && Input.GetKeyDown(KeyCode.E))
+        {
+            ManualFlip();
+        }
+    }
+
+    private void InitiateSpaceTransition(SpaceType newSpaceType)
+    {
+        switch (newSpaceType)
+        {
+            case SpaceType.Normal:
+                if (currentState != normalState)
+                {
+                    TransitionTo(normalState);
+                }
+                break;
+
+            case SpaceType.BlackSpace:
+                if (currentState != mirroredState)
+                {
+                    // Use improved entry positioning
+                    if (TryEnterBlackSpaceImproved())
+                    {
+                        TransitionTo(mirroredState);
+                    }
+                    else
+                    {
+                        // Entry failed, stay in normal space
+                        Debug.Log("Black space entry failed - invalid entry point");
+                        return;
+                    }
+                }
+                break;
+
+            case SpaceType.Fluid:
+                // Fluid doesn't change the base state, but affects movement
+                break;
+        }
+
+        isTransitioning = true;
+        transitionTimer = 0f;
+    }
+
+    private bool TryEnterBlackSpaceImproved()
+    {
+        // Check fluid restriction first
+        if (preventInversionInFluid && IsInFluid())
+        {
+            Debug.Log("Cannot enter black space - in fluid");
+            return false;
+        }
+
+        // Check grounded requirement
+        if (requireGroundedForInversion)
+        {
+            CheckGrounded();
+            if (!isGrounded)
+            {
+                Debug.Log("Cannot enter black space - not grounded");
+                return false;
+            }
+        }
+
+        EntryInfo entryInfo = FindBestEntryPoint(transform.position);
+
+        if (!entryInfo.isValid)
+        {
+            Debug.Log("No valid black space entry point found");
+            return false;
+        }
+
+        // Store entry information
+        entryPoint = transform.position;
+        currentNormal = entryInfo.normal;
+
+        // Position player at the entry point
+        if (snapToValidPosition)
+        {
+            transform.position = entryInfo.position;
+        }
+
+        Debug.Log($"Entering black space with quality {entryInfo.quality:F2}, normal {entryInfo.normal}, grounded: {isGrounded}");
+        return true;
+    }
+
+    private void ManualFlip()
+    {
+        lastFlipTime = Time.time;
+
+        // Manual flip overrides automatic detection temporarily
+        if (currentState == normalState)
+        {
+            // Check fluid restriction for manual flip
+            if (preventInversionInFluid && IsInFluid())
+            {
+                Debug.Log("Cannot manually flip to black space - in fluid");
+                return;
+            }
+
+            // Check grounded requirement for manual flip
+            if (requireGroundedForInversion)
+            {
+                CheckGrounded();
+                if (!isGrounded)
+                {
+                    Debug.Log("Cannot manually flip to black space - not grounded");
+                    return;
+                }
+            }
+
+            // Try to find black space to enter
+            if (TryFindNearbyBlackSpace(out Vector2 entryPos, out Vector2 normal))
+            {
+                transform.position = entryPos;
+                currentNormal = normal;
+                TransitionTo(mirroredState);
+            }
+        }
+        else
+        {
+            // Check grounded requirement for manual exit
+            if (requireGroundedForInversion)
+            {
+                bool isGroundedInBlackSpace = CheckMirroredGrounded();
+                if (!isGroundedInBlackSpace)
+                {
+                    Debug.Log("Cannot manually flip to normal space - not grounded in black space");
+                    return;
+                }
+            }
+
+            // Exit to normal space
+            Vector2 exitPos = FindExitPoint();
+            transform.position = exitPos;
+            TransitionTo(normalState);
+        }
+
+        // Create a small splash effect when manually flipping
+        CreateSplashEffect();
+    }
+
+    private bool TryFindNearbyBlackSpace(out Vector2 entryPos, out Vector2 normal)
+    {
+        EntryInfo entryInfo = FindBestEntryPoint(transform.position);
+
+        if (entryInfo.isValid)
+        {
+            entryPos = entryInfo.position;
+            normal = entryInfo.normal;
+            return true;
+        }
+
+        entryPos = Vector2.zero;
+        normal = Vector2.zero;
+        return false;
+    }
+
+    // === State Management ===
     private void TransitionTo(IPlayerState next)
     {
         currentState?.Exit();
@@ -80,12 +482,107 @@ public class PlayerManager : MonoBehaviour
         currentState.Enter();
     }
 
+    public bool IsInMirroredState()
+    {
+        return currentState == mirroredState;
+    }
+
     public bool CanFlip() => Time.time - lastFlipTime >= flipCooldown;
 
-    public void Flip()
+    public SpaceType GetCurrentSpaceType() => currentSpaceType;
+    public bool IsTransitioning() => isTransitioning;
+
+    // === Fluid Interaction (keeping your existing system) ===
+    void UpdateVelocityTracking()
     {
-        lastFlipTime = Time.time;
-        TransitionTo(currentState == normalState ? mirroredState : normalState);
+        Vector2 currentPos = transform.position;
+        velocityBuffer = (currentPos - lastPosition) / Time.fixedDeltaTime;
+        lastPosition = currentPos;
+    }
+
+    void CheckFluidInteraction()
+    {
+        if (!enableFluidInteraction || fluidSim == null) return;
+
+        bool wasInFluidPreviously = isInFluid;
+        isInFluid = IsInFluid();
+
+        if (isInFluid)
+        {
+            timeInFluid += Time.deltaTime;
+
+            if (!wasInFluidPreviously && rb.linearVelocity.magnitude > splashThreshold)
+            {
+                CreateSplashEffect();
+                lastSplashTime = Time.time;
+            }
+        }
+        else
+        {
+            timeInFluid = 0f;
+        }
+
+        wasInFluid = isInFluid;
+    }
+
+    bool IsInFluid()
+    {
+        if (fluidSim != null && fluidSim.boundaryCollider != null)
+        {
+            return fluidSim.boundaryCollider.OverlapPoint(transform.position);
+        }
+
+        Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(transform.position, fluidPushRadius);
+
+        foreach (var collider in nearbyColliders)
+        {
+            if (collider.CompareTag("Fluid") || collider.name.Contains("Particle"))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void CreateSplashEffect()
+    {
+        if (splashEffect != null && Time.time - lastSplashTime > 0.5f)
+        {
+            splashEffect.transform.position = transform.position;
+            splashEffect.Play();
+        }
+    }
+
+    // === Movement Property Getters ===
+    public Vector2 GetVelocity() => rb.linearVelocity;
+
+    public float GetMovementIntensity()
+    {
+        return Mathf.Clamp01(rb.linearVelocity.magnitude / (moveSpeed * 2f));
+    }
+
+    public float GetCurrentMoveSpeed()
+    {
+        if (isInFluid)
+        {
+            return moveSpeed * fluidMoveSpeedMultiplier;
+        }
+        return moveSpeed;
+    }
+
+    public float GetCurrentJumpForce()
+    {
+        if (isInFluid)
+        {
+            return jumpForce * fluidJumpMultiplier;
+        }
+        return jumpForce;
+    }
+
+    public bool CanSwim()
+    {
+        return isInFluid && IsInMirroredState() && canSwimInMirroredState;
     }
 
     // === State Interface ===
@@ -97,7 +594,7 @@ public class PlayerManager : MonoBehaviour
         void HandleFixedUpdate();
     }
 
-    // === Normal Movement ===
+    // === Normal Movement State ===
     private class NormalState : IPlayerState
     {
         private PlayerManager pm;
@@ -107,8 +604,15 @@ public class PlayerManager : MonoBehaviour
         public void Enter()
         {
             pm.rb.gravityScale = 1;
-            // Ensure normal collision with black space is disabled
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
+
+            // Smooth transition to upright
+            if (pm.maintainUpright)
+            {
+                pm.StartCoroutine(pm.SmoothRotationTransition(Quaternion.identity));
+            }
+
+            Debug.Log("Player entered normal state");
         }
 
         public void Exit() { }
@@ -119,60 +623,58 @@ public class PlayerManager : MonoBehaviour
             if (input.x != 0) pm.sr.flipX = input.x < 0;
 
             pm.CheckGrounded();
-            if (Input.GetKeyDown(KeyCode.Space) && pm.isGrounded)
-                pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, pm.jumpForce);
 
-            if (pm.CanFlip() && Input.GetKeyDown(KeyCode.E)) pm.Flip();
-            
-            // Handle pushing objects
+            if (Input.GetKeyDown(KeyCode.Space))
+            {
+                if (pm.isGrounded || (pm.isInFluid && pm.timeInFluid > 0.1f))
+                {
+                    float jumpForce = pm.GetCurrentJumpForce();
+                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpForce);
+
+                    if (pm.isInFluid)
+                    {
+                        pm.CreateSplashEffect();
+                    }
+                }
+            }
+
             HandlePushInteraction();
         }
 
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
-            pm.rb.linearVelocity = new Vector2(input.x * pm.moveSpeed, pm.rb.linearVelocity.y);
+            float currentMoveSpeed = pm.GetCurrentMoveSpeed();
+            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
 
             Vector2 normal = pm.DetectGroundNormal();
             if (pm.maintainUpright) pm.RotateToMatchNormal(normal);
             pm.sr.color = Color.Lerp(pm.sr.color, pm.normalColor, Time.deltaTime * 10f);
         }
 
-                private void HandlePushInteraction()
+        private void HandlePushInteraction()
         {
-            // Determine push direction based on player facing
             Vector2 pushDirection = pm.sr.flipX ? Vector2.left : Vector2.right;
-            
-            // Cast ray to detect objects in the black space layer
             RaycastHit2D hit = Physics2D.Raycast(
                 pm.transform.position,
                 pushDirection,
                 pm.pushCheckDistance,
                 1 << pm.blackSpaceLayer);
-                
-            // Debug visualization
-            Debug.DrawRay(pm.transform.position, pushDirection * pm.pushCheckDistance, 
-                         hit.collider != null ? Color.green : Color.red, 0.1f);
-            
-            // If we hit something and player is pressing the push button
+
             if (hit.collider != null && Input.GetKey(KeyCode.F))
             {
                 Rigidbody2D objRb = hit.collider.GetComponent<Rigidbody2D>();
-                
-                // Check if object has Rigidbody2D and is not static
+
                 if (objRb != null && objRb.bodyType == RigidbodyType2D.Dynamic)
                 {
-                    // Apply force in push direction
                     objRb.AddForce(pushDirection * pm.pushForce, ForceMode2D.Force);
-                    
-                    // Optional: Slow down player while pushing
                     pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x * 0.7f, pm.rb.linearVelocity.y);
                 }
             }
         }
     }
 
-    // === Mirrored (Negative Space) Movement ===
+    // === Mirrored (Black Space) Movement State ===
     private class MirroredState : IPlayerState
     {
         private PlayerManager pm;
@@ -182,42 +684,22 @@ public class PlayerManager : MonoBehaviour
 
         public void Enter()
         {
-            // Try to enter black space, return to normal state if failed
-            if (!pm.TryEnterBlackSpace())
-            {
-                pm.TransitionTo(pm.normalState);
-                return;
-            }
+            pm.rb.gravityScale = -1f;
+            pm.rb.linearVelocity = Vector2.zero;
+            Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
 
-            // Important: First set upright orientation to make entry smoother
+            // Smooth transition to inverted
             if (pm.maintainUpright)
             {
-                float deg = Mathf.Atan2(pm.currentNormal.x, pm.currentNormal.y) * Mathf.Rad2Deg;
-                pm.transform.rotation = Quaternion.Euler(0, 0, -deg);
+                pm.StartCoroutine(pm.SmoothRotationTransition(Quaternion.Euler(0, 0, 180)));
             }
 
-            // Configure physics for mirrored state - do this AFTER positioning
-            pm.rb.gravityScale = -1f; // Invert gravity
-            pm.rb.linearVelocity = Vector2.zero; // Reset velocity for clean transition
-
-            // Enable collisions with black space (we need to stand on it)
-            Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
+            Debug.Log("Player entered mirrored state");
         }
 
         public void Exit()
         {
-            // Calculate exit position using the older version's reliable method
-            Vector2 exitPos = pm.FindExitPoint();
-
-            // Reset physics state
-            pm.rb.linearVelocity = Vector2.zero;
-            pm.transform.rotation = Quaternion.identity;
-            pm.rb.gravityScale = 1f; // Reset to normal gravity
-
-            // Move to exit position
-            pm.transform.position = exitPos;
-
-            // Reset collision
+            pm.rb.gravityScale = 1f;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
         }
 
@@ -226,107 +708,81 @@ public class PlayerManager : MonoBehaviour
             input.x = Input.GetAxisRaw("Horizontal");
             if (input.x != 0) pm.sr.flipX = input.x < 0;
 
-            // Check if player is standing on black space
             bool isGroundedInBlackSpace = pm.CheckMirroredGrounded();
 
-            // Jump DOWNWARD (since gravity is inverted)
-            if (Input.GetKeyDown(KeyCode.Space) && isGroundedInBlackSpace)
+            if (Input.GetKeyDown(KeyCode.Space))
             {
-                pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, -pm.jumpForce);
-            }
+                if (isGroundedInBlackSpace || pm.CanSwim())
+                {
+                    float jumpForce = pm.GetCurrentJumpForce();
+                    Vector2 jumpDirection = pm.CanSwim() ? Vector2.up : Vector2.down;
+                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpDirection.y * jumpForce);
 
-            if (pm.CanFlip() && Input.GetKeyDown(KeyCode.E)) pm.Flip();
+                    if (pm.isInFluid)
+                    {
+                        pm.CreateSplashEffect();
+                    }
+                }
+            }
         }
 
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
+            float currentMoveSpeed = pm.GetCurrentMoveSpeed();
+            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
 
-            // Basic horizontal movement
-            pm.rb.linearVelocity = new Vector2(input.x * pm.moveSpeed, pm.rb.linearVelocity.y);
+            if (pm.CanSwim())
+            {
+                pm.transform.rotation = Quaternion.Slerp(
+                    pm.transform.rotation,
+                    Quaternion.Euler(0, 0, 0),
+                    Time.deltaTime * pm.rotationSpeed
+                );
+            }
+            else if (pm.maintainUpright)
+            {
+                pm.transform.rotation = Quaternion.Slerp(
+                    pm.transform.rotation,
+                    Quaternion.Euler(0, 0, 180),
+                    Time.deltaTime * pm.rotationSpeed * 2f
+                );
+            }
 
-            // Keep player rotated upside down
-            pm.transform.rotation = Quaternion.Slerp(
-                pm.transform.rotation,
-                Quaternion.Euler(0, 0, 180), // Upside down
-                Time.deltaTime * pm.rotationSpeed * 2f // Double rotation speed for quicker flipping
-            );
-
-            // Update surface normal and entry point
-            pm.UpdateSurfaceNormal();
-            pm.UpdateEntryPoint();
-
-            // Update color
             pm.sr.color = Color.Lerp(pm.sr.color, pm.mirroredColor, Time.deltaTime * 10f);
         }
     }
 
+    // === Helper Coroutines ===
+    private System.Collections.IEnumerator SmoothRotationTransition(Quaternion targetRotation)
+    {
+        Quaternion startRotation = transform.rotation;
+        float elapsed = 0f;
+
+        while (elapsed < transitionSmoothTime)
+        {
+            elapsed += Time.deltaTime;
+            float progress = elapsed / transitionSmoothTime;
+            transform.rotation = Quaternion.Slerp(startRotation, targetRotation, progress);
+            yield return null;
+        }
+
+        transform.rotation = targetRotation;
+        isTransitioning = false;
+    }
+
+    // === Utility Functions (keeping your existing ones) ===
     private bool CheckMirroredGrounded()
     {
-        // In mirrored state, check UPWARD to see if we're standing on black space
         RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.up, 0.2f, 1 << blackSpaceLayer);
         bool isOnBlackSpace = hit.collider != null;
-
-        // Debug visualization
-        Debug.DrawRay(groundChecker.position, Vector2.up * 0.2f,
-                     isOnBlackSpace ? Color.green : Color.red, 0.1f);
-
         return isOnBlackSpace;
     }
 
-    private void MaintainEdgeDistance()
-    {
-        var hit = Physics2D.Raycast(transform.position, -currentNormal,
-                                    detectionRadius, solidLayerMask);
-        if (hit.collider != null &&
-            hit.collider.gameObject.layer == blackSpaceLayer)
-        {
-            Vector2 desired = hit.point + currentNormal * edgeFollowDistance;
-            transform.position = Vector2.Lerp(transform.position,
-                                              desired,
-                                              Time.deltaTime * 10f);
-        }
-    }
-
-    // Improved edge direction sampling
-    private Vector2 CalculateEdgeDirection()
-    {
-        List<Vector2> pts = new List<Vector2>();
-        for (float ang = 0; ang < 360; ang += 15f)
-        {
-            float r = ang * Mathf.Deg2Rad;
-            Vector2 d = new Vector2(Mathf.Cos(r), Mathf.Sin(r));
-            var hit = Physics2D.Raycast(transform.position, d,
-                                         detectionRadius, solidLayerMask);
-            if (hit.collider != null &&
-                hit.collider.gameObject.layer == blackSpaceLayer)
-                pts.Add(hit.point);
-        }
-        if (pts.Count < 2)
-            return new Vector2(-currentNormal.y, currentNormal.x).normalized;
-
-        Vector2 a = pts[0], b = pts[0]; float maxDist = 0f;
-        for (int i = 0; i < pts.Count; i++)
-            for (int j = i + 1; j < pts.Count; j++)
-            {
-                float d = (pts[i] - pts[j]).sqrMagnitude;
-                if (d > maxDist)
-                {
-                    maxDist = d;
-                    a = pts[i]; b = pts[j];
-                }
-            }
-        Vector2 edge = (b - a).normalized;
-        return Vector2.Dot(edge, Vector2.right) >= 0 ? edge : -edge;
-    }
-
-    // === Utility Functions ===
     private void CheckGrounded()
     {
         RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.down, 0.2f, solidLayerMask);
         isGrounded = hit.collider != null;
-        Debug.DrawRay(groundChecker.position, Vector2.down * 0.2f,
-                      isGrounded ? Color.green : Color.red, 0.1f);
     }
 
     private Vector2 DetectGroundNormal()
@@ -344,139 +800,117 @@ public class PlayerManager : MonoBehaviour
                                              Time.deltaTime * rotationSpeed);
     }
 
-    private bool TryEnterBlackSpace()
-    {
-        RaycastHit2D bestHit = default;
-        float bestDist = Mathf.Infinity;
-
-        // Cast rays in all directions to find closest black space
-        for (int i = 0; i < 12; i++)
-        {
-            float angle = i * 30f * Mathf.Deg2Rad;
-            Vector2 dir = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
-            var hit = Physics2D.Raycast(transform.position, dir,
-                                         detectionRadius, solidLayerMask);
-            if (hit.collider != null &&
-                hit.collider.gameObject.layer == blackSpaceLayer &&
-                hit.distance < bestDist)
-            {
-                bestDist = hit.distance;
-                bestHit = hit;
-            }
-        }
-
-        // No black space found nearby
-        if (bestDist == Mathf.Infinity) return false;
-
-        // Store entry data
-        entryPoint = transform.position;
-        currentNormal = bestHit.normal;
-
-        // Move just inside black space
-        transform.position = bestHit.point - currentNormal * edgeFollowDistance;
-
-        // Initially rotate player to match entry angle
-        if (maintainUpright)
-        {
-            float deg = Mathf.Atan2(currentNormal.x, currentNormal.y) * Mathf.Rad2Deg;
-            transform.rotation = Quaternion.Euler(0, 0, -deg);
-        }
-
-        // Important: Ignore collisions with black space during edge following
-        Physics2D.IgnoreLayerCollision(gameObject.layer, blackSpaceLayer, true);
-
-        return true;
-    }
-
     private Vector2 FindExitPoint()
     {
-        // First try to exit from current position
-        RaycastHit2D hit = Physics2D.Raycast(transform.position, currentNormal,
-                                             detectionRadius, solidLayerMask);
+        // Find nearest normal space
+        Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(
+            transform.position,
+            detectionRadius,
+            normalSpaceLayer
+        );
 
-        // If we hit something that's not black space, exit toward that point
-        if (hit.collider != null && hit.collider.gameObject.layer != blackSpaceLayer)
+        if (nearbyColliders.Length > 0)
         {
-            return hit.point + currentNormal * edgeFollowDistance;
+            // Find the closest normal space
+            float closestDist = Mathf.Infinity;
+            Vector2 closestPoint = transform.position;
+
+            foreach (var collider in nearbyColliders)
+            {
+                Vector2 point = collider.ClosestPoint(transform.position);
+                float dist = Vector2.Distance(transform.position, point);
+
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closestPoint = point + (Vector2)(transform.position - (Vector3)point).normalized * edgeFollowDistance;
+                }
+            }
+
+            return closestPoint;
         }
 
-        // If we don't hit a valid exit point, try casting multiple rays
-        Vector2 bestExitPos = transform.position + (Vector3)(currentNormal * edgeFollowDistance);
-        float bestDistance = Mathf.Infinity;
+        // Fallback: move up and out
+        return transform.position + Vector3.up * edgeFollowDistance * 2f;
+    }
 
-        // Try rays in a fan pattern around the current normal
-        for (int i = -2; i <= 2; i++)
+    /*void OnDrawGizmosSelected()
+    {
+        if (!Application.isPlaying) return;
+
+        // Space detection radius
+        Gizmos.color = currentSpaceType == SpaceType.BlackSpace ? Color.red :
+                      currentSpaceType == SpaceType.Fluid ? Color.blue : Color.green;
+        Gizmos.DrawWireSphere(transform.position, spaceCheckRadius);
+
+        // Detection radius
+        Gizmos.color = Color.gray;
+        Gizmos.DrawWireSphere(transform.position, detectionRadius);
+
+        // Draw entry validation rays if restricting side entry
+        if (restrictSideEntry)
         {
-            float angle = i * 30f * Mathf.Deg2Rad;
-            Vector2 dir = RotateVector(currentNormal, angle);
+            Vector2[] checkDirections = {
+                Vector2.down, Vector2.up, Vector2.left, Vector2.right,
+                new Vector2(-0.7f, -0.7f), new Vector2(0.7f, -0.7f),
+                new Vector2(-0.7f, 0.7f), new Vector2(0.7f, 0.7f)
+            };
 
-            hit = Physics2D.Raycast(transform.position, dir, detectionRadius * 2f, solidLayerMask);
-            if (hit.collider != null && hit.collider.gameObject.layer != blackSpaceLayer)
+            EntryInfo bestEntry = FindBestEntryPoint(transform.position);
+
+            for (int i = 0; i < checkDirections.Length; i++)
             {
-                float dist = hit.distance;
-                if (dist < bestDistance)
-                {
-                    bestDistance = dist;
-                    bestExitPos = hit.point + dir * edgeFollowDistance;
-                }
+                Vector2 dir = checkDirections[i];
+                float verticalBias = Mathf.Abs(dir.y);
+
+                // Color code based on entry quality
+                if (i == 0) Gizmos.color = Color.green; // Down - preferred
+                else if (i == 1) Gizmos.color = Color.yellow; // Up - good
+                else if (verticalBias >= verticalEntryBias) Gizmos.color = new Color(1f, 0.5f, 0f); // Acceptable (orange)
+                else Gizmos.color = Color.red; // Poor side entry
+
+                Gizmos.DrawRay(transform.position, dir * detectionRadius * 0.8f);
+            }
+
+            // Draw best entry point
+            if (bestEntry.isValid)
+            {
+                Gizmos.color = Color.cyan;
+                Gizmos.DrawSphere(bestEntry.position, 0.1f);
+                Gizmos.DrawLine(transform.position, bestEntry.position);
             }
         }
 
-        // If all else fails, just use the current position and normal
-        if (bestDistance == Mathf.Infinity)
+        // Fluid interaction radius
+        if (enableFluidInteraction)
         {
-            // Just move outward from current position along normal
-            return transform.position + (Vector3)(currentNormal * edgeFollowDistance * 2f);
+            Gizmos.color = IsInMirroredState() ?
+                new Color(1, 0, 1, 0.3f) : new Color(0, 1, 1, 0.3f);
+            Gizmos.DrawWireSphere(transform.position, fluidPushRadius);
+
+            if (isInFluid)
+            {
+                Gizmos.color = Color.blue;
+                Gizmos.DrawWireCube(transform.position + Vector3.up, Vector3.one * 0.3f);
+            }
         }
 
-        return bestExitPos;
-    }
+        // Current space type indicator
+        Gizmos.color = Color.yellow;
+        Vector3 textPos = transform.position + Vector3.up * 1.5f;
 
-    private Vector2 RotateVector(Vector2 v, float angle)
-    {
-        float cos = Mathf.Cos(angle);
-        float sin = Mathf.Sin(angle);
-        return new Vector2(
-            v.x * cos - v.y * sin,
-            v.x * sin + v.y * cos
-        );
-    }
-
-    private void UpdateSurfaceNormal()
-    {
-        var hit = Physics2D.Raycast(transform.position, -currentNormal,
-                                    detectionRadius, solidLayerMask);
-        if (hit.collider != null &&
-            hit.collider.gameObject.layer == blackSpaceLayer)
+#if UNITY_EDITOR
+        UnityEditor.Handles.Label(textPos, $"Space: {currentSpaceType}");
+        if (restrictSideEntry && currentSpaceType != SpaceType.BlackSpace)
         {
-            currentNormal = hit.normal;
+            EntryInfo info = FindBestEntryPoint(transform.position);
+            if (info.isValid)
+            {
+                UnityEditor.Handles.Label(textPos + Vector3.up * 0.3f, $"Entry Quality: {info.quality:F2}");
+            }
         }
+#endif
     }
+*/
 
-    private void UpdateEntryPoint()
-    {
-        // Update the entry point to be the current position
-        entryPoint = transform.position;
-    }
-
-    void OnDrawGizmosSelected()
-    {
-        if (!Application.isPlaying) return;
-        Gizmos.color = Color.gray;
-        Gizmos.DrawWireSphere(transform.position, detectionRadius);
-        Gizmos.color = Color.green;
-        Gizmos.DrawSphere(entryPoint, 0.1f);
-
-        if (currentState == mirroredState)
-        {
-            // Draw the predicted exit point
-            Vector2 exitPos = FindExitPoint();
-            Gizmos.color = Color.blue;
-            Gizmos.DrawSphere(exitPos, 0.1f);
-
-            // Draw the direction of exit
-            Gizmos.color = Color.yellow;
-            Gizmos.DrawLine(transform.position, transform.position + (Vector3)(currentNormal * 0.5f));
-        }
-    }
 }

@@ -1,0 +1,56 @@
+#pragma kernel CSMain
+
+// Input data from fluid simulation
+StructuredBuffer<float2> Positions;
+StructuredBuffer<float2> Densities;
+uint NumParticles;
+float SmoothingRadius;
+float DensityScale = 1.0;
+
+// Output texture (now with depth=2)
+RWTexture3D<float> DensityTexture;
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Get dimensions of the texture
+    uint width, height, depth;
+    DensityTexture.GetDimensions(width, height, depth);
+    
+    // Convert texture coordinates to world space (assuming -1 to 1 range)
+    float2 worldPos;
+    worldPos.x = ((float)id.x / width) * 2.0 - 1.0;
+    worldPos.y = ((float)id.y / height) * 2.0 - 1.0;
+    
+    float density = 0.0;
+    
+    // Sum contributions from all particles
+    for (uint i = 0; i < NumParticles; i++)
+    {
+        float2 particlePos = Positions[i];
+        
+        // Calculate distance
+        float2 diff = particlePos - worldPos;
+        float sqrDst = dot(diff, diff);
+        
+        if (sqrDst < SmoothingRadius * SmoothingRadius)
+        {
+            // Get the particle's density value
+            float particleDensity = Densities[i].x;
+            
+            // Apply smoothing kernel (cubic)
+            float r = sqrt(sqrDst) / SmoothingRadius;
+            float w = max(0.0, 1.0 - r * r * r);
+            
+            // Add contribution from this particle
+            density += particleDensity * w * w * w;
+        }
+    }
+    
+    // Scale density for better visualization
+    density *= DensityScale;
+    
+    // Write to both Z slices of the 3D texture to ensure marching cubes has data for both layers
+    DensityTexture[uint3(id.xy, 0)] = density;
+    DensityTexture[uint3(id.xy, 1)] = density;
+}
