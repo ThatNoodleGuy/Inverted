@@ -124,13 +124,18 @@ const float2 interactionInputPoint;
 const float interactionInputStrength;
 const float interactionInputRadius;
 
-// Player interaction settings - ADDED THESE!
+// Player interaction settings
 const float2 playerPosition;
 const float playerInteractionRadius;
 const float playerInteractionStrength;
 const float2 playerVelocity;
 const float velocityTransferStrength;
 const bool isPlayerInMirroredState;
+
+// Player fluid control parameters
+const float2 playerFluidControlPoint;
+const float playerFluidControlStrength;
+const float playerFluidControlRadius;
 
 float DensityKernel(float dst, float radius)
 {
@@ -227,7 +232,7 @@ float2 ExternalForces(float2 pos, float2 velocity)
         }
     }
 
-    // Player interaction (NEW CODE!)
+    // Player interaction (existing code)
     if (playerInteractionRadius > 0 && abs(playerInteractionStrength) > 0.001)
     {
         float2 playerOffset = playerPosition - pos;
@@ -267,6 +272,26 @@ float2 ExternalForces(float2 pos, float2 velocity)
                 float2 randomDir = float2(cos(pos.x * 12.345), sin(pos.y * 67.89));
                 totalAccel += normalize(randomDir) * abs(playerInteractionStrength) * 2.0;
             }
+        }
+    }
+
+    // NEW: Player fluid control interaction (Z/X keys)
+    if (playerFluidControlRadius > 0 && abs(playerFluidControlStrength) > 0.001)
+    {
+        float2 controlOffset = playerFluidControlPoint - pos;
+        float controlDist = length(controlOffset);
+        
+        if (controlDist > 0.01 && controlDist < playerFluidControlRadius)
+        {
+            float2 controlDir = controlOffset / controlDist;
+            float controlInfluence = 1.0 - (controlDist / playerFluidControlRadius);
+            
+            // Apply smooth falloff (quadratic for smoother interaction)
+            controlInfluence = controlInfluence * controlInfluence;
+            
+            // Apply the control force (positive = pull toward player, negative = push away)
+            float2 controlForce = controlDir * playerFluidControlStrength * controlInfluence;
+            totalAccel += controlForce;
         }
     }
 

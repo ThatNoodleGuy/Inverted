@@ -60,6 +60,15 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private float fluidJumpMultiplier = 1.2f;
     [SerializeField] private bool canSwimInMirroredState = true;
 
+    [Header("Player Fluid Control")]
+    [SerializeField] private bool enablePlayerFluidControl = true;
+    [SerializeField] private float playerFluidInteractionStrength = 10f;
+    [SerializeField] private float playerFluidInteractionRadius = 3f;
+    [SerializeField] private KeyCode fluidPullKey = KeyCode.Z;
+    [SerializeField] private KeyCode fluidPushKey = KeyCode.X;
+    [SerializeField] private bool requireFluidProximityForControl = true;
+    [SerializeField] private float fluidControlProximityRadius = 2f;
+
     // === Space Types ===
     public enum SpaceType
     {
@@ -97,6 +106,10 @@ public class PlayerManager : MonoBehaviour
     private float fluidImpactForce;
     private bool isInFluid;
     private float timeInFluid;
+
+    private bool isFluidPulling;
+    private bool isFluidPushing;
+    private float fluidControlStrength;
 
     void Awake()
     {
@@ -142,6 +155,13 @@ public class PlayerManager : MonoBehaviour
 
         currentState.HandleUpdate();
         CheckFluidInteraction();
+
+        // NEW: Add this line to ensure fluid interaction is always updated
+        // (This provides a fallback in case states don't call it)
+        if (!currentState.GetType().Name.Contains("State"))
+        {
+            HandleFluidInteraction(); // Fallback call
+        }
     }
 
     void FixedUpdate()
@@ -668,6 +688,9 @@ public class PlayerManager : MonoBehaviour
                 }
             }
 
+            // NEW: Add fluid interaction handling
+            pm.HandleFluidInteraction();
+
             HandlePushInteraction();
         }
 
@@ -754,6 +777,9 @@ public class PlayerManager : MonoBehaviour
                     }
                 }
             }
+
+            // NEW: Add fluid interaction handling
+            pm.HandleFluidInteraction();
         }
 
         public void HandleFixedUpdate()
@@ -780,6 +806,27 @@ public class PlayerManager : MonoBehaviour
             }
 
             pm.sr.color = Color.Lerp(pm.sr.color, pm.mirroredColor, Time.deltaTime * 10f);
+        }
+
+        private void HandlePlayerFluidControls()
+        {
+            pm.HandleFluidInteraction();
+
+            // Optional: Visual feedback for fluid control
+            if (pm.IsPlayerControllingFluid())
+            {
+                // You could add particle effects, screen shake, or other feedback here
+                if (pm.isFluidPulling)
+                {
+                    // Visual feedback for pulling
+                    Debug.Log("Player pulling fluid");
+                }
+                else if (pm.isFluidPushing)
+                {
+                    // Visual feedback for pushing  
+                    Debug.Log("Player pushing fluid");
+                }
+            }
         }
     }
 
@@ -885,6 +932,113 @@ public class PlayerManager : MonoBehaviour
             return fluidSim.GetNearbyParticleCount();
         }
         return 0;
+    }
+
+    private void HandleFluidInteraction()
+    {
+        if (!enablePlayerFluidControl || !enableFluidInteraction)
+        {
+            isFluidPulling = false;
+            isFluidPushing = false;
+            fluidControlStrength = 0f;
+            return;
+        }
+
+        // Check if player is near fluid (if required)
+        if (requireFluidProximityForControl)
+        {
+            bool nearFluid = false;
+
+            if (fluidSim != null)
+            {
+                // Check if player is within control proximity of fluid
+                Vector2 playerPos = transform.position;
+
+                // Use the cached particle positions from FluidSim2D if available
+                if (fluidSim.positionBuffer != null && fluidSim.numParticles > 0)
+                {
+                    // We'll check this through the fluid sim's existing methods
+                    nearFluid = IsInFluid() || GetDistanceToNearestFluidParticle() <= fluidControlProximityRadius;
+                }
+            }
+
+            if (!nearFluid)
+            {
+                isFluidPulling = false;
+                isFluidPushing = false;
+                fluidControlStrength = 0f;
+                return;
+            }
+        }
+
+        // Handle input
+        isFluidPulling = Input.GetKey(fluidPullKey);
+        isFluidPushing = Input.GetKey(fluidPushKey);
+
+        // Calculate interaction strength
+        if (isFluidPushing || isFluidPulling)
+        {
+            fluidControlStrength = isFluidPushing ? -playerFluidInteractionStrength : playerFluidInteractionStrength;
+
+            // Modify strength based on player state
+            if (IsInMirroredState())
+            {
+                fluidControlStrength *= 1.3f; // Stronger interaction in mirrored state
+            }
+
+            // Reduce strength if player is moving fast to prevent overpowered effects
+            float movementFactor = Mathf.Clamp01(2f - (rb.linearVelocity.magnitude / moveSpeed));
+            fluidControlStrength *= movementFactor;
+        }
+        else
+        {
+            fluidControlStrength = 0f;
+        }
+    }
+
+    // Add this helper method:
+    private float GetDistanceToNearestFluidParticle()
+    {
+        if (fluidSim == null) return float.MaxValue;
+
+        // This is a simplified check - in a full implementation, you'd want to 
+        // check against actual particle positions, but this gives a reasonable approximation
+        Vector2 playerPos = transform.position;
+
+        // Check if we're in the general fluid area
+        if (fluidSim.IsPlayerInFluid())
+        {
+            return 0f; // Already in fluid
+        }
+
+        // For now, return a reasonable estimate based on fluid detection radius
+        return fluidSim.fluidDetectionRadius;
+    }
+
+    // Add these public methods for FluidSim2D to query:
+    public bool IsPlayerControllingFluid()
+    {
+        return enablePlayerFluidControl && (isFluidPulling || isFluidPushing);
+    }
+
+    public float GetPlayerFluidControlStrength()
+    {
+        return fluidControlStrength;
+    }
+
+    public float GetPlayerFluidControlRadius()
+    {
+        return playerFluidInteractionRadius;
+    }
+
+    public Vector2 GetPlayerFluidControlPosition()
+    {
+        return transform.position;
+    }
+
+    public float GetCurrentPlayerInteractionStrength()
+    {
+        return playerFluidInteractionStrength;
     }
 
     /*

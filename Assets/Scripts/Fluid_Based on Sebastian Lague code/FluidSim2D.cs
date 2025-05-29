@@ -96,6 +96,12 @@ public class FluidSim2D : MonoBehaviour
 	public float interactionRadius;
 	public float interactionStrength;
 
+	[Header("Player Fluid Control")]
+	[Tooltip("Allow player to directly control fluid with keys")]
+	public bool enablePlayerFluidControl = true;
+	[Tooltip("Visual effect when player controls fluid")]
+	public ParticleSystem playerFluidControlEffect;
+
 	[Header("References")]
 	public ComputeShader compute;
 	public Spawner2D spawner2D;
@@ -344,81 +350,81 @@ public class FluidSim2D : MonoBehaviour
 		UpdateSubmersionDepth();
 	}
 
-void UpdateSubmersionDepth()
-{
-    if (player == null)
-    {
-        currentSubmersionDepth = 0f;
-        smoothedSubmersionDepth = 0f;
-        return;
-    }
+	void UpdateSubmersionDepth()
+	{
+		if (player == null)
+		{
+			currentSubmersionDepth = 0f;
+			smoothedSubmersionDepth = 0f;
+			return;
+		}
 
-    float rawSubmersion = 0f;
+		float rawSubmersion = 0f;
 
-    if (useParticleBasedDetection)
-    {
-        rawSubmersion = CalculateImprovedParticleBasedSubmersion();
-    }
-    else
-    {
-        // Keep original polygon-based calculation as fallback
-        if (boundaryComposite == null)
-        {
-            rawSubmersion = 0f;
-        }
-        else
-        {
-            Vector2 playerPos = player.transform.position;
-            if (!boundaryComposite.OverlapPoint(playerPos))
-            {
-                rawSubmersion = 0f;
-            }
-            else
-            {
-                float minDistToBoundary = float.MaxValue;
-                int pathCount = boundaryComposite.pathCount;
-                for (int p = 0; p < pathCount; ++p)
-                {
-                    int count = boundaryComposite.GetPathPointCount(p);
-                    Vector2[] pts = new Vector2[count];
-                    boundaryComposite.GetPath(p, pts);
+		if (useParticleBasedDetection)
+		{
+			rawSubmersion = CalculateImprovedParticleBasedSubmersion();
+		}
+		else
+		{
+			// Keep original polygon-based calculation as fallback
+			if (boundaryComposite == null)
+			{
+				rawSubmersion = 0f;
+			}
+			else
+			{
+				Vector2 playerPos = player.transform.position;
+				if (!boundaryComposite.OverlapPoint(playerPos))
+				{
+					rawSubmersion = 0f;
+				}
+				else
+				{
+					float minDistToBoundary = float.MaxValue;
+					int pathCount = boundaryComposite.pathCount;
+					for (int p = 0; p < pathCount; ++p)
+					{
+						int count = boundaryComposite.GetPathPointCount(p);
+						Vector2[] pts = new Vector2[count];
+						boundaryComposite.GetPath(p, pts);
 
-                    for (int i = 0; i < count; ++i)
-                    {
-                        Vector3 w1 = boundaryComposite.transform.TransformPoint(pts[i]);
-                        Vector3 w2 = boundaryComposite.transform.TransformPoint(pts[(i + 1) % count]);
-                        float dist = DistanceToLineSegment(playerPos, w1, w2);
-                        minDistToBoundary = Mathf.Min(minDistToBoundary, dist);
-                    }
-                }
-                rawSubmersion = Mathf.Clamp(minDistToBoundary, 0f, maxBuoyancyDepth);
-            }
-        }
-    }
+						for (int i = 0; i < count; ++i)
+						{
+							Vector3 w1 = boundaryComposite.transform.TransformPoint(pts[i]);
+							Vector3 w2 = boundaryComposite.transform.TransformPoint(pts[(i + 1) % count]);
+							float dist = DistanceToLineSegment(playerPos, w1, w2);
+							minDistToBoundary = Mathf.Min(minDistToBoundary, dist);
+						}
+					}
+					rawSubmersion = Mathf.Clamp(minDistToBoundary, 0f, maxBuoyancyDepth);
+				}
+			}
+		}
 
-    // Apply threshold - only register submersion above minimum threshold
-    if (rawSubmersion < buoyancyThreshold)
-    {
-        rawSubmersion = 0f;
-    }
+		// Apply threshold - only register submersion above minimum threshold
+		if (rawSubmersion < buoyancyThreshold)
+		{
+			rawSubmersion = 0f;
+		}
 
-    // Smooth the submersion depth to prevent oscillations
-    if (Time.deltaTime > 0)
-    {
-        smoothedSubmersionDepth = Mathf.Lerp(smoothedSubmersionDepth, rawSubmersion, 
-            submersionSmoothingFactor * (1f / Time.deltaTime) * Time.deltaTime);
-    }
+		// Smooth the submersion depth to prevent oscillations
+		if (Time.deltaTime > 0)
+		{
+			smoothedSubmersionDepth = Mathf.Lerp(smoothedSubmersionDepth, rawSubmersion,
+				submersionSmoothingFactor * (1f / Time.deltaTime) * Time.deltaTime);
+		}
 
-    // Detect if we're near a fluid edge and reduce buoyancy accordingly
-    isNearFluidEdge = IsPlayerNearFluidEdge();
-    if (isNearFluidEdge)
-    {
-        smoothedSubmersionDepth *= edgeBuoyancyReduction;
-    }
+		// Detect if we're near a fluid edge and reduce buoyancy accordingly
+		isNearFluidEdge = IsPlayerNearFluidEdge();
+		if (isNearFluidEdge)
+		{
+			smoothedSubmersionDepth *= edgeBuoyancyReduction;
+		}
 
-    currentSubmersionDepth = smoothedSubmersionDepth;
-    lastSubmersionDepth = rawSubmersion;
-}
+		currentSubmersionDepth = smoothedSubmersionDepth;
+		lastSubmersionDepth = rawSubmersion;
+	}
 
 	bool IsPlayerNearFluidParticles()
 	{
@@ -493,49 +499,49 @@ void UpdateSubmersionDepth()
 	}
 
 	bool IsPlayerNearFluidEdge()
-{
-    if (!particlePositionsCached || cachedParticlePositions == null) return false;
+	{
+		if (!particlePositionsCached || cachedParticlePositions == null) return false;
 
-    Vector2 playerPos = player.transform.position;
-    float edgeRadiusSqr = edgeDetectionRadius * edgeDetectionRadius;
-    
-    // Count particles in different directions around the player
-    int[] directionCounts = new int[8]; // 8 directions around player
-    Vector2[] directions = {
-        Vector2.up, Vector2.down, Vector2.left, Vector2.right,
-        new Vector2(1, 1).normalized, new Vector2(-1, 1).normalized,
-        new Vector2(1, -1).normalized, new Vector2(-1, -1).normalized
-    };
+		Vector2 playerPos = player.transform.position;
+		float edgeRadiusSqr = edgeDetectionRadius * edgeDetectionRadius;
 
-    foreach (Vector2 particlePos in cachedParticlePositions)
-    {
-        Vector2 offset = particlePos - playerPos;
-        float distSqr = offset.sqrMagnitude;
-        
-        if (distSqr <= edgeRadiusSqr && distSqr > 0.01f)
-        {
-            // Determine which direction this particle is in
-            float angle = Mathf.Atan2(offset.y, offset.x);
-            int dirIndex = Mathf.FloorToInt(((angle + Mathf.PI) / (2f * Mathf.PI)) * 8f) % 8;
-            directionCounts[dirIndex]++;
-        }
-    }
+		// Count particles in different directions around the player
+		int[] directionCounts = new int[8]; // 8 directions around player
+		Vector2[] directions = {
+		Vector2.up, Vector2.down, Vector2.left, Vector2.right,
+		new Vector2(1, 1).normalized, new Vector2(-1, 1).normalized,
+		new Vector2(1, -1).normalized, new Vector2(-1, -1).normalized
+	};
 
-    // If any direction has significantly fewer particles, we're near an edge
-    int avgCount = 0;
-    foreach (int count in directionCounts) avgCount += count;
-    avgCount /= 8;
+		foreach (Vector2 particlePos in cachedParticlePositions)
+		{
+			Vector2 offset = particlePos - playerPos;
+			float distSqr = offset.sqrMagnitude;
 
-    foreach (int count in directionCounts)
-    {
-        if (count < avgCount * 0.3f) // Less than 30% of average
-        {
-            return true;
-        }
-    }
+			if (distSqr <= edgeRadiusSqr && distSqr > 0.01f)
+			{
+				// Determine which direction this particle is in
+				float angle = Mathf.Atan2(offset.y, offset.x);
+				int dirIndex = Mathf.FloorToInt(((angle + Mathf.PI) / (2f * Mathf.PI)) * 8f) % 8;
+				directionCounts[dirIndex]++;
+			}
+		}
 
-    return false;
-}
+		// If any direction has significantly fewer particles, we're near an edge
+		int avgCount = 0;
+		foreach (int count in directionCounts) avgCount += count;
+		avgCount /= 8;
+
+		foreach (int count in directionCounts)
+		{
+			if (count < avgCount * 0.3f) // Less than 30% of average
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
 
 	void ApplyFluidForcesToPlayer()
 	{
@@ -702,7 +708,10 @@ void UpdateSubmersionDepth()
 		compute.SetFloat("interactionInputStrength", currInteractStrength);
 		compute.SetFloat("interactionInputRadius", interactionRadius);
 
-		// Player interaction settings
+		// Player fluid control settings
+		UpdatePlayerFluidControlSettings();
+
+		// Player interaction settings (existing)
 		UpdatePlayerInteractionSettings();
 
 		// Update boundary settings if they've changed
@@ -710,6 +719,60 @@ void UpdateSubmersionDepth()
 		{
 			compute.SetFloat("_BoundaryCollisionMargin", boundaryCollisionMargin);
 			compute.SetFloat("_CollisionResponseStrength", collisionResponseStrength);
+		}
+	}
+
+	void UpdatePlayerFluidControlSettings()
+	{
+		if (!enablePlayerFluidControl || player == null)
+		{
+			// Disable player fluid control
+			compute.SetVector("playerFluidControlPoint", Vector2.zero);
+			compute.SetFloat("playerFluidControlStrength", 0f);
+			compute.SetFloat("playerFluidControlRadius", 0f);
+			return;
+		}
+
+		// Get player fluid control state
+		bool isControlling = player.IsPlayerControllingFluid();
+
+		if (isControlling)
+		{
+			Vector2 controlPos = player.GetPlayerFluidControlPosition();
+			float controlStrength = player.GetPlayerFluidControlStrength();
+			float controlRadius = player.GetPlayerFluidControlRadius();
+
+			// Set compute shader parameters for player fluid control
+			compute.SetVector("playerFluidControlPoint", controlPos);
+			compute.SetFloat("playerFluidControlStrength", controlStrength);
+			compute.SetFloat("playerFluidControlRadius", controlRadius);
+
+			// Optional: Trigger visual effects
+			if (playerFluidControlEffect != null && !playerFluidControlEffect.isPlaying)
+			{
+				playerFluidControlEffect.transform.position = controlPos;
+				playerFluidControlEffect.Play();
+			}
+
+			// Debug output (reduced frequency)
+			if (Time.frameCount % 60 == 0) // Every second
+			{
+				string action = controlStrength > 0 ? "Pulling" : "Pushing";
+				Debug.Log($"Player Fluid Control - {action} with strength {Mathf.Abs(controlStrength):F2} at radius {controlRadius:F2}");
+			}
+		}
+		else
+		{
+			// No active control
+			compute.SetVector("playerFluidControlPoint", Vector2.zero);
+			compute.SetFloat("playerFluidControlStrength", 0f);
+			compute.SetFloat("playerFluidControlRadius", 0f);
+
+			// Stop visual effects
+			if (playerFluidControlEffect != null && playerFluidControlEffect.isPlaying)
+			{
+				playerFluidControlEffect.Stop();
+			}
 		}
 	}
 
@@ -789,97 +852,6 @@ void UpdateSubmersionDepth()
 
 	void OnDrawGizmos()
 	{
-		// // Draw polygon boundary gizmo
-		// if (boundaryComposite != null && boundaryComposite.points.Length > 1)
-		// {
-		// 	Gizmos.color = new Color(0, 1, 0, 0.7f);
-		// 	Vector2[] localPoints = boundaryComposite.points;
-
-		// 	for (int i = 0; i < localPoints.Length; i++)
-		// 	{
-		// 		Vector3 p1 = boundaryComposite.transform.TransformPoint(localPoints[i]);
-		// 		Vector3 p2 = boundaryComposite.transform.TransformPoint(localPoints[(i + 1) % localPoints.Length]);
-		// 		Gizmos.DrawLine(p1, p2);
-		// 	}
-
-		// 	// Draw collision margin
-		// 	Gizmos.color = new Color(1, 1, 0, 0.3f);
-		// 	for (int i = 0; i < localPoints.Length; i++)
-		// 	{
-		// 		Vector3 p1 = boundaryComposite.transform.TransformPoint(localPoints[i]);
-		// 		Vector3 p2 = boundaryComposite.transform.TransformPoint(localPoints[(i + 1) % localPoints.Length]);
-
-		// 		Vector3 segmentDir = (p2 - p1).normalized;
-		// 		Vector3 normal = new Vector3(-segmentDir.y, segmentDir.x, 0) * boundaryCollisionMargin;
-
-		// 		if (invertBoundary)
-		// 			normal = -normal;
-
-		// 		Gizmos.DrawLine(p1 + normal, p2 + normal);
-		// 	}
-		// }
-
-		// 		// Draw player interaction radius
-		// 		if (Application.isPlaying && player != null)
-		// 		{
-		// 			Vector3 playerPos = player.transform.position;
-
-		// 			// Draw interaction radius with intensity based on settings
-		// 			if (player.IsInMirroredState())
-		// 			{
-		// 				Gizmos.color = new Color(1, 0, 1, 0.3f); // Magenta for mirrored state
-		// 			}
-		// 			else
-		// 			{
-		// 				Gizmos.color = new Color(0, 1, 1, 0.3f); // Cyan for normal state
-		// 			}
-
-		// 			// Draw multiple rings to show interaction falloff
-		// 			for (int i = 1; i <= 3; i++)
-		// 			{
-		// 				float alpha = 0.3f / i;
-		// 				Color ringColor = Gizmos.color;
-		// 				ringColor.a = alpha;
-		// 				Gizmos.color = ringColor;
-		// 				Gizmos.DrawWireSphere(playerPos, playerInteractionRadius * i * 0.4f);
-		// 			}
-
-		// 			// Draw buoyancy visualization
-		// 			if (currentSubmersionDepth > 0f)
-		// 			{
-		// 				Gizmos.color = Color.blue;
-		// 				Vector3 buoyancyViz = playerPos + Vector3.up * (currentBuoyancyForce * 0.1f);
-		// 				Gizmos.DrawLine(playerPos, buoyancyViz);
-		// 				Gizmos.DrawWireCube(buoyancyViz, Vector3.one * 0.2f);
-
-		// 				// Draw submersion depth indicator
-		// 				Gizmos.color = new Color(0, 0, 1, 0.3f);
-		// 				Gizmos.DrawWireSphere(playerPos, currentSubmersionDepth);
-		// 			}
-
-		// 			// Draw velocity vector with magnitude indication
-		// 			if (playerVelocity.magnitude > 0.1f)
-		// 			{
-		// 				Gizmos.color = Color.yellow;
-		// 				Gizmos.DrawLine(playerPos, playerPos + (Vector3)playerVelocity);
-
-		// 				// Draw interaction strength indicator
-		// 				float strengthIndicator = GetCurrentPlayerInteractionStrength();
-		// 				Gizmos.color = strengthIndicator > 0 ? Color.green : Color.red;
-		// 				Gizmos.DrawWireCube(playerPos + Vector3.up * 0.5f, Vector3.one * 0.1f * Mathf.Abs(strengthIndicator));
-		// 			}
-
-		// 			// Debug text in scene view
-		// #if UNITY_EDITOR
-		// 			UnityEditor.Handles.Label(playerPos + Vector3.up * 1f,
-		// 				$"Interaction: {GetCurrentPlayerInteractionStrength():F2}\n" +
-		// 				$"Buoyancy: {currentBuoyancyForce:F2}\n" +
-		// 				$"Depth: {currentSubmersionDepth:F2}\n" +
-		// 				$"Velocity: {playerVelocity.magnitude:F1}\n" +
-		// 				$"State: {(player.IsInMirroredState() ? "Mirrored" : "Normal")}");
-		// #endif
-		// 		}
-
 		// Draw mouse interaction
 		if (Application.isPlaying)
 		{
@@ -892,6 +864,40 @@ void UpdateSubmersionDepth()
 			{
 				Gizmos.color = isPullInteraction ? Color.green : Color.red;
 				Gizmos.DrawWireSphere(mousePos, interactionRadius);
+			}
+
+			// Draw player fluid control interaction
+			if (enablePlayerFluidControl && player != null && player.IsPlayerControllingFluid())
+			{
+				Vector2 playerControlPos = player.GetPlayerFluidControlPosition();
+				float controlStrength = player.GetPlayerFluidControlStrength();
+				float controlRadius = player.GetPlayerFluidControlRadius();
+
+				// Different colors for pull vs push
+				Gizmos.color = controlStrength > 0 ?
+					new Color(0f, 1f, 0.5f, 0.7f) :  // Green-cyan for pull
+					new Color(1f, 0.5f, 0f, 0.7f);   // Orange-red for push
+
+				// Draw main interaction sphere
+				Gizmos.DrawWireSphere(playerControlPos, controlRadius);
+
+				// Draw strength indicator with inner sphere
+				float strengthRatio = Mathf.Abs(controlStrength) / player.GetCurrentPlayerInteractionStrength();
+				Gizmos.color = new Color(Gizmos.color.r, Gizmos.color.g, Gizmos.color.b, 0.3f);
+				Gizmos.DrawSphere(playerControlPos, controlRadius * strengthRatio * 0.5f);
+
+				// Draw directional arrows to show pull/push
+				Gizmos.color = controlStrength > 0 ? Color.cyan : Color.red;
+				Vector3 arrowDirection = controlStrength > 0 ? Vector3.up : Vector3.down;
+				Vector3 arrowStart = playerControlPos + Vector2.up * 0.5f;
+				Vector3 arrowEnd = arrowStart + arrowDirection * 0.3f;
+				Gizmos.DrawLine(arrowStart, arrowEnd);
+
+				// Arrow head
+				Vector3 arrowHead1 = arrowEnd + (Vector3.left + -arrowDirection).normalized * 0.1f;
+				Vector3 arrowHead2 = arrowEnd + (Vector3.right + -arrowDirection).normalized * 0.1f;
+				Gizmos.DrawLine(arrowEnd, arrowHead1);
+				Gizmos.DrawLine(arrowEnd, arrowHead2);
 			}
 		}
 	}
@@ -928,71 +934,71 @@ void UpdateSubmersionDepth()
 		return boundaryComposite.OverlapPoint(playerPos);
 	}
 
-float CalculateImprovedParticleBasedSubmersion()
-{
-    if (!particlePositionsCached || cachedParticlePositions == null) return 0f;
+	float CalculateImprovedParticleBasedSubmersion()
+	{
+		if (!particlePositionsCached || cachedParticlePositions == null) return 0f;
 
-    Vector2 playerPos = player.transform.position;
-    
-    // Use a more conservative radius for submersion calculation
-    float submersionRadius = Mathf.Min(maxBuoyancyDepth, playerInteractionRadius * 1.2f);
-    float submersionRadiusSqr = submersionRadius * submersionRadius;
+		Vector2 playerPos = player.transform.position;
 
-    // Collect nearby particles with their weights
-    var nearbyParticles = new List<(Vector2 pos, float weight, float distance)>();
+		// Use a more conservative radius for submersion calculation
+		float submersionRadius = Mathf.Min(maxBuoyancyDepth, playerInteractionRadius * 1.2f);
+		float submersionRadiusSqr = submersionRadius * submersionRadius;
 
-    for (int i = 0; i < cachedParticlePositions.Length; i++)
-    {
-        Vector2 particlePos = cachedParticlePositions[i];
-        float distSqr = (playerPos - particlePos).sqrMagnitude;
+		// Collect nearby particles with their weights
+		var nearbyParticles = new List<(Vector2 pos, float weight, float distance)>();
 
-        if (distSqr <= submersionRadiusSqr)
-        {
-            float dist = Mathf.Sqrt(distSqr);
-            // Use smoother falloff curve
-            float normalizedDist = dist / submersionRadius;
-            float weight = Mathf.Pow(1f - normalizedDist, 2f); // Quadratic falloff
-            
-            nearbyParticles.Add((particlePos, weight, dist));
-        }
-    }
+		for (int i = 0; i < cachedParticlePositions.Length; i++)
+		{
+			Vector2 particlePos = cachedParticlePositions[i];
+			float distSqr = (playerPos - particlePos).sqrMagnitude;
 
-    // Limit the number of particles to prevent performance issues and edge effects
-    if (nearbyParticles.Count > maxParticlesForSubmersion)
-    {
-        nearbyParticles.Sort((a, b) => a.distance.CompareTo(b.distance));
-        nearbyParticles = nearbyParticles.GetRange(0, maxParticlesForSubmersion);
-    }
+			if (distSqr <= submersionRadiusSqr)
+			{
+				float dist = Mathf.Sqrt(distSqr);
+				// Use smoother falloff curve
+				float normalizedDist = dist / submersionRadius;
+				float weight = Mathf.Pow(1f - normalizedDist, 2f); // Quadratic falloff
 
-    if (nearbyParticles.Count == 0) return 0f;
+				nearbyParticles.Add((particlePos, weight, dist));
+			}
+		}
 
-    // Calculate weighted average submersion with better particle distribution consideration
-    float totalWeight = 0f;
-    float weightedDepth = 0f;
-    float particleDensity = 0f;
+		// Limit the number of particles to prevent performance issues and edge effects
+		if (nearbyParticles.Count > maxParticlesForSubmersion)
+		{
+			nearbyParticles.Sort((a, b) => a.distance.CompareTo(b.distance));
+			nearbyParticles = nearbyParticles.GetRange(0, maxParticlesForSubmersion);
+		}
 
-    foreach (var particle in nearbyParticles)
-    {
-        totalWeight += particle.weight;
-        // Calculate depth based on how "surrounded" the player is by particles
-        float depth = Mathf.Max(0f, submersionRadius - particle.distance);
-        weightedDepth += particle.weight * depth;
-        particleDensity += particle.weight;
-    }
+		if (nearbyParticles.Count == 0) return 0f;
 
-    if (totalWeight <= 0f) return 0f;
+		// Calculate weighted average submersion with better particle distribution consideration
+		float totalWeight = 0f;
+		float weightedDepth = 0f;
+		float particleDensity = 0f;
 
-    float averageDepth = weightedDepth / totalWeight;
-    
-    // Normalize based on particle density - need minimum density for full buoyancy
-    float requiredDensityForFullBuoyancy = minParticlesForFluidDetection * 0.8f;
-    float densityFactor = Mathf.Clamp01(particleDensity / requiredDensityForFullBuoyancy);
-    
-    // Apply a more conservative scaling to prevent over-buoyancy
-    float finalSubmersion = averageDepth * densityFactor * 0.7f; // Scale down by 30%
-    
-    return Mathf.Clamp(finalSubmersion, 0f, maxBuoyancyDepth);
-}
+		foreach (var particle in nearbyParticles)
+		{
+			totalWeight += particle.weight;
+			// Calculate depth based on how "surrounded" the player is by particles
+			float depth = Mathf.Max(0f, submersionRadius - particle.distance);
+			weightedDepth += particle.weight * depth;
+			particleDensity += particle.weight;
+		}
+
+		if (totalWeight <= 0f) return 0f;
+
+		float averageDepth = weightedDepth / totalWeight;
+
+		// Normalize based on particle density - need minimum density for full buoyancy
+		float requiredDensityForFullBuoyancy = minParticlesForFluidDetection * 0.8f;
+		float densityFactor = Mathf.Clamp01(particleDensity / requiredDensityForFullBuoyancy);
+
+		// Apply a more conservative scaling to prevent over-buoyancy
+		float finalSubmersion = averageDepth * densityFactor * 0.7f; // Scale down by 30%
+
+		return Mathf.Clamp(finalSubmersion, 0f, maxBuoyancyDepth);
+	}
 
 	public bool IsPlayerInFluid()
 	{
