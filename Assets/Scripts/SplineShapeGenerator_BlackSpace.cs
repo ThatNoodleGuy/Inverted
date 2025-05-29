@@ -23,6 +23,7 @@ public class SplineShapeGenerator_BlackSpace : MonoBehaviour
         GameObject splineObj = new GameObject("SquareSpline");
         splineObj.transform.SetParent(transform);
         splineObj.transform.localPosition = Vector3.zero;
+        splineObj.gameObject.layer = LayerMask.NameToLayer("BlackSpace");
 
         // Add a SplineContainer component
         SplineContainer container = splineObj.AddComponent<SplineContainer>();
@@ -53,6 +54,7 @@ public class SplineShapeGenerator_BlackSpace : MonoBehaviour
         GameObject splineObj = new GameObject("CircleSpline");
         splineObj.transform.SetParent(transform);
         splineObj.transform.localPosition = Vector3.zero;
+        splineObj.gameObject.layer = LayerMask.NameToLayer("BlackSpace");
 
         // Add a SplineContainer component
         SplineContainer container = splineObj.AddComponent<SplineContainer>();

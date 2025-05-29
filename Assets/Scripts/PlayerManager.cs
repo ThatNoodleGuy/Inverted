@@ -89,7 +89,6 @@ public class PlayerManager : MonoBehaviour
     // Space detection
     private SpaceType currentSpaceType;
     private SpaceType previousSpaceType;
-    private float transitionTimer;
     private bool isTransitioning;
 
     // Fluid interaction tracking
@@ -357,7 +356,6 @@ public class PlayerManager : MonoBehaviour
         }
 
         isTransitioning = true;
-        transitionTimer = 0f;
     }
 
     private bool TryEnterBlackSpaceImproved()
@@ -502,7 +500,7 @@ public class PlayerManager : MonoBehaviour
 
     void CheckFluidInteraction()
     {
-        if (!enableFluidInteraction || fluidSim == null) return;
+        if (!enableFluidInteraction) return;
 
         bool wasInFluidPreviously = isInFluid;
         isInFluid = IsInFluid();
@@ -511,10 +509,19 @@ public class PlayerManager : MonoBehaviour
         {
             timeInFluid += Time.deltaTime;
 
-            if (!wasInFluidPreviously && rb.linearVelocity.magnitude > splashThreshold)
+            // Create splash effect when entering fluid or moving fast
+            if ((!wasInFluidPreviously && rb.linearVelocity.magnitude > splashThreshold) ||
+                (Time.time - lastSplashTime > 1f && rb.linearVelocity.magnitude > splashThreshold * 1.5f))
             {
                 CreateSplashEffect();
                 lastSplashTime = Time.time;
+            }
+
+            // NEW: Debug output for particle-based fluid detection
+            if (fluidSim != null && Time.frameCount % 60 == 0) // Every second
+            {
+                Debug.Log($"Player in fluid - Nearby particles: {fluidSim.GetNearbyParticleCount()}, " +
+                         $"Submersion depth: {fluidSim.GetPlayerSubmersionDepth():F2}");
             }
         }
         else
@@ -527,13 +534,14 @@ public class PlayerManager : MonoBehaviour
 
     bool IsInFluid()
     {
-        if (fluidSim != null && fluidSim.boundaryCollider != null)
+        // NEW: Use FluidSim2D's particle-based detection
+        if (fluidSim != null)
         {
-            return fluidSim.boundaryCollider.OverlapPoint(transform.position);
+            return fluidSim.IsPlayerInFluid();
         }
 
+        // FALLBACK: Old proximity-based detection for other fluid objects
         Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(transform.position, fluidPushRadius);
-
         foreach (var collider in nearbyColliders)
         {
             if (collider.CompareTag("Fluid") || collider.name.Contains("Particle"))
@@ -564,25 +572,47 @@ public class PlayerManager : MonoBehaviour
 
     public float GetCurrentMoveSpeed()
     {
-        if (isInFluid)
+        if (IsInFluid())
         {
-            return moveSpeed * fluidMoveSpeedMultiplier;
+            // NEW: Scale movement based on submersion depth
+            float submersion = GetFluidSubmersionLevel();
+            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
+            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
+
+            // More submersion = more movement reduction
+            float fluidModifier = Mathf.Lerp(1f, fluidMoveSpeedMultiplier, submersionRatio);
+            return moveSpeed * fluidModifier;
         }
         return moveSpeed;
     }
 
     public float GetCurrentJumpForce()
     {
-        if (isInFluid)
+        if (IsInFluid())
         {
-            return jumpForce * fluidJumpMultiplier;
+            // NEW: Scale jump based on submersion depth
+            float submersion = GetFluidSubmersionLevel();
+            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
+            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
+
+            // More submersion = more jump boost
+            float fluidModifier = Mathf.Lerp(1f, fluidJumpMultiplier, submersionRatio);
+            return jumpForce * fluidModifier;
         }
         return jumpForce;
     }
 
     public bool CanSwim()
     {
-        return isInFluid && IsInMirroredState() && canSwimInMirroredState;
+        if (!IsInFluid()) return false;
+
+        // NEW: Require minimum submersion to swim
+        float submersion = GetFluidSubmersionLevel();
+        float minSubmersionForSwimming = 0.5f; // Minimum depth needed to swim
+
+        return submersion >= minSubmersionForSwimming &&
+               IsInMirroredState() &&
+               canSwimInMirroredState;
     }
 
     // === State Interface ===
@@ -834,83 +864,89 @@ public class PlayerManager : MonoBehaviour
         return transform.position + Vector3.up * edgeFollowDistance * 2f;
     }
 
-    /*void OnDrawGizmosSelected()
+    public bool IsInFluidArea()
     {
-        if (!Application.isPlaying) return;
+        return IsInFluid();
+    }
 
-        // Space detection radius
-        Gizmos.color = currentSpaceType == SpaceType.BlackSpace ? Color.red :
-                      currentSpaceType == SpaceType.Fluid ? Color.blue : Color.green;
-        Gizmos.DrawWireSphere(transform.position, spaceCheckRadius);
-
-        // Detection radius
-        Gizmos.color = Color.gray;
-        Gizmos.DrawWireSphere(transform.position, detectionRadius);
-
-        // Draw entry validation rays if restricting side entry
-        if (restrictSideEntry)
+    public float GetFluidSubmersionLevel()
+    {
+        if (fluidSim != null)
         {
-            Vector2[] checkDirections = {
-                Vector2.down, Vector2.up, Vector2.left, Vector2.right,
-                new Vector2(-0.7f, -0.7f), new Vector2(0.7f, -0.7f),
-                new Vector2(-0.7f, 0.7f), new Vector2(0.7f, 0.7f)
-            };
+            return fluidSim.GetPlayerSubmersionDepth();
+        }
+        return 0f;
+    }
 
-            EntryInfo bestEntry = FindBestEntryPoint(transform.position);
+    public int GetNearbyFluidParticleCount()
+    {
+        if (fluidSim != null)
+        {
+            return fluidSim.GetNearbyParticleCount();
+        }
+        return 0;
+    }
 
-            for (int i = 0; i < checkDirections.Length; i++)
+    /*
+// ==== OPTIONAL: Enhanced debug gizmos ====
+void OnDrawGizmosSelected()
+{
+    if (!Application.isPlaying) return;
+
+    // Existing gizmos...
+    
+    // NEW: Draw fluid detection status
+    if (enableFluidInteraction && fluidSim != null)
+    {
+        Vector3 playerPos = transform.position;
+        
+        // Draw fluid detection radius
+        Gizmos.color = IsInFluid() ? Color.cyan : Color.gray;
+        if (fluidSim.useParticleBasedDetection)
+        {
+            Gizmos.DrawWireSphere(playerPos, fluidSim.fluidDetectionRadius);
+        }
+        
+        // Draw submersion depth indicator
+        float submersion = GetFluidSubmersionLevel();
+        if (submersion > 0f)
+        {
+            Gizmos.color = new Color(0, 0, 1, 0.3f);
+            Gizmos.DrawWireSphere(playerPos, submersion);
+            
+            // Draw submersion bar
+            Gizmos.color = Color.blue;
+            Vector3 barStart = playerPos + Vector3.right * 1f;
+            Vector3 barEnd = barStart + Vector3.up * submersion;
+            Gizmos.DrawLine(barStart, barEnd);
+            Gizmos.DrawWireCube(barEnd, Vector3.one * 0.1f);
+        }
+        
+        // Draw particle count indicator
+        int particleCount = GetNearbyFluidParticleCount();
+        if (particleCount > 0)
+        {
+            Gizmos.color = Color.yellow;
+            for (int i = 0; i < Mathf.Min(particleCount, 10); i++)
             {
-                Vector2 dir = checkDirections[i];
-                float verticalBias = Mathf.Abs(dir.y);
-
-                // Color code based on entry quality
-                if (i == 0) Gizmos.color = Color.green; // Down - preferred
-                else if (i == 1) Gizmos.color = Color.yellow; // Up - good
-                else if (verticalBias >= verticalEntryBias) Gizmos.color = new Color(1f, 0.5f, 0f); // Acceptable (orange)
-                else Gizmos.color = Color.red; // Poor side entry
-
-                Gizmos.DrawRay(transform.position, dir * detectionRadius * 0.8f);
-            }
-
-            // Draw best entry point
-            if (bestEntry.isValid)
-            {
-                Gizmos.color = Color.cyan;
-                Gizmos.DrawSphere(bestEntry.position, 0.1f);
-                Gizmos.DrawLine(transform.position, bestEntry.position);
+                float angle = (i / 10f) * 360f * Mathf.Deg2Rad;
+                Vector3 offset = new Vector3(Mathf.Cos(angle), Mathf.Sin(angle)) * 0.5f;
+                Gizmos.DrawWireCube(playerPos + Vector3.up * 0.8f + offset, Vector3.one * 0.05f);
             }
         }
-
-        // Fluid interaction radius
-        if (enableFluidInteraction)
-        {
-            Gizmos.color = IsInMirroredState() ?
-                new Color(1, 0, 1, 0.3f) : new Color(0, 1, 1, 0.3f);
-            Gizmos.DrawWireSphere(transform.position, fluidPushRadius);
-
-            if (isInFluid)
-            {
-                Gizmos.color = Color.blue;
-                Gizmos.DrawWireCube(transform.position + Vector3.up, Vector3.one * 0.3f);
-            }
-        }
-
-        // Current space type indicator
-        Gizmos.color = Color.yellow;
-        Vector3 textPos = transform.position + Vector3.up * 1.5f;
+    }
 
 #if UNITY_EDITOR
-        UnityEditor.Handles.Label(textPos, $"Space: {currentSpaceType}");
-        if (restrictSideEntry && currentSpaceType != SpaceType.BlackSpace)
-        {
-            EntryInfo info = FindBestEntryPoint(transform.position);
-            if (info.isValid)
-            {
-                UnityEditor.Handles.Label(textPos + Vector3.up * 0.3f, $"Entry Quality: {info.quality:F2}");
-            }
-        }
+    // Enhanced debug text
+    Vector3 textPos = transform.position + Vector3.up * 2f;
+    UnityEditor.Handles.Label(textPos, 
+        $"Space: {currentSpaceType}\n" +
+        $"In Fluid: {IsInFluid()}\n" +
+        $"Submersion: {GetFluidSubmersionLevel():F2}\n" +
+        $"Particles: {GetNearbyFluidParticleCount()}\n" +
+        $"Can Swim: {CanSwim()}");
 #endif
-    }
+}
 */
 
 }

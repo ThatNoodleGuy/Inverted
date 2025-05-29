@@ -302,111 +302,75 @@ bool IsPointInsidePolygon(float2 testPos)
 [numthreads(NumThreads, 1, 1)]
 void PolygonCollision(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= numParticles) return;
+    uint i = id.x;
+    if (i >= numParticles || _NumBoundaryPoints < 2) return;
 
-    float2 pos = Positions[id.x];
-    float2 vel = Velocities[id.x];
+    // 1) Load current pos + vel
+    float2 pos = PredictedPositions[i];
+    float2 vel = Velocities[i];
 
-    if (_NumBoundaryPoints < 2) return;
+    // 2) Find closest point on boundary and its (outward) normal
+    float  minSqDist    = 1e20;
+    float2 bestNormal   = float2(0,1);
 
-    float minSqDist = 1.0e10;
-    float2 closestPointOnBoundary = float2(0, 0);
-    float2 boundaryNormal = float2(0, 0);
-
-    // Find closest point on polygon boundary
-    for (uint i = 0; i < _NumBoundaryPoints; i++)
+    for (uint b = 0; b < _NumBoundaryPoints; ++b)
     {
-        float2 p1 = _BoundaryPoints[i];
-        float2 p2 = _BoundaryPoints[(i + 1) % _NumBoundaryPoints];
+        // segment [p1,p2]
+        float2 p1 = _BoundaryPoints[b];
+        float2 p2 = _BoundaryPoints[(b+1) % _NumBoundaryPoints];
+        float2 seg = p2 - p1;
+        float  segLenSq = dot(seg,seg);
+        if (segLenSq < 1e-6) continue;
 
-        float2 segmentDir = p2 - p1;
-        float segmentLenSq = dot(segmentDir, segmentDir);
+        // project pos onto segment
+        float t = saturate(dot(pos - p1, seg) / segLenSq);
+        float2 proj = p1 + seg * t;
 
-        if (segmentLenSq < 0.0001f) continue;
+        float2 diff = pos - proj;
+        float dsq  = dot(diff, diff);
 
-        float t = dot(pos - p1, segmentDir) / segmentLenSq;
-        t = clamp(t, 0.0f, 1.0f);
-
-        float2 pointOnSegment = p1 + t * segmentDir;
-        float2 displacement = pos - pointOnSegment;
-        float distSq = dot(displacement, displacement);
-
-        if (distSq < minSqDist)
+        if (dsq < minSqDist)
         {
-            minSqDist = distSq;
-            closestPointOnBoundary = pointOnSegment;
-            
-            float2 segmentNormal = float2(-segmentDir.y, segmentDir.x);
-            segmentNormal = normalize(segmentNormal);
-            
-            float2 segmentCenter = (p1 + p2) * 0.5f;
-            float2 toParticle = pos - segmentCenter;
-            
-            if (dot(segmentNormal, toParticle) < 0.0f)
-            {
-                segmentNormal = -segmentNormal;
-            }
-            
-            boundaryNormal = segmentNormal;
+            minSqDist  = dsq;
+            // normal is from boundary→particle
+            bestNormal = (dsq > 1e-6) ? normalize(diff) : bestNormal;
         }
     }
 
-    float dist = sqrt(minSqDist);
-    
-    bool shouldCollide = false;
-    
+    float  dist = sqrt(minSqDist);
+    bool   inside = IsPointInsidePolygon(pos);
+
+    // 3) Decide if we must collide (penetration)
+    bool shouldCollide;
     if (_InvertBoundary)
-    {
-        bool isInside = IsPointInsidePolygon(pos);
-        shouldCollide = isInside || (dist < _BoundaryCollisionMargin);
-        if (isInside)
-        {
-            boundaryNormal = -boundaryNormal;
-        }
-    }
+        shouldCollide = inside || (dist < _BoundaryCollisionMargin);
     else
-    {
-        bool isInside = IsPointInsidePolygon(pos);
-        shouldCollide = !isInside || (dist < _BoundaryCollisionMargin);
-        if (!isInside)
-        {
-            boundaryNormal = -boundaryNormal;
-        }
-    }
+        shouldCollide = !inside || (dist < _BoundaryCollisionMargin);
 
     if (shouldCollide && dist < _BoundaryCollisionMargin)
     {
-        if (dot(boundaryNormal, boundaryNormal) < 0.0001f)
-        {
-            boundaryNormal = float2(0, 1);
-        }
-        else
-        {
-            boundaryNormal = normalize(boundaryNormal);
-        }
+        // if we flipped interior/exterior, invert normal
+        if (_InvertBoundary == inside)
+            bestNormal = -bestNormal;
 
-        float penetrationDepth = _BoundaryCollisionMargin - dist;
-        float positionCorrection = penetrationDepth * _CollisionResponseStrength;
-        pos += boundaryNormal * positionCorrection;
+        // push out by the penetration amount
+        float pen = (_BoundaryCollisionMargin - dist) * _CollisionResponseStrength;
+        pos += bestNormal * pen;
 
-        float velocityDotNormal = dot(vel, boundaryNormal);
-        if (velocityDotNormal < 0.0f)
+        // reflect & damp velocity
+        float vn = dot(vel, bestNormal);
+        if (vn < 0)
         {
-            vel = vel - 2.0f * velocityDotNormal * boundaryNormal;
+            vel -= 2.0f * vn * bestNormal;
             vel *= collisionDamping;
         }
-        
-        if (dist < _BoundaryCollisionMargin * 0.5f)
-        {
-            vel *= 0.8f;
-        }
+
+        Positions[i]  = pos;
+        Velocities[i] = vel;
     }
 
-    Positions[id.x] = pos;
-    Velocities[id.x] = vel;
-    
-    const float predictionFactor = 1 / 120.0;
-    PredictedPositions[id.x] = pos + vel * predictionFactor;
+    // update predicted position for next step
+    PredictedPositions[i] = pos + vel * deltaTime;
 }
 
 [numthreads(NumThreads, 1, 1)]
