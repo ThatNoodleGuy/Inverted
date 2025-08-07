@@ -1,11 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-/// <summary>
-/// Enhanced PlayerManager with automatic space-based state transitions
-/// </summary>
+
 [RequireComponent(typeof(Rigidbody2D), typeof(SpriteRenderer), typeof(CapsuleCollider2D))]
 public class PlayerManager : MonoBehaviour
 {
@@ -29,17 +28,16 @@ public class PlayerManager : MonoBehaviour
 
     [Header("Space Detection")]
     [SerializeField] private float spaceCheckRadius = 0.3f;
-    [SerializeField] private LayerMask normalSpaceLayer = 1; // Default layer for normal space
+    [SerializeField] private LayerMask normalSpaceLayer = 1;
     [SerializeField] private bool enableManualOverride = true;
     [SerializeField] private float transitionSmoothTime = 0.3f;
 
     [Header("Entry Validation")]
-    [SerializeField] private bool restrictSideEntry = true; // Prevent problematic side entries
-    [SerializeField] private bool requireGroundedForInversion = true; // Only allow inversion when grounded
-    [SerializeField] private bool preventInversionInFluid = true; // Prevent inversion when in fluid
-    [SerializeField] private float verticalEntryBias = 0.7f; // Prefer vertical entries (0.5 = no bias, 1.0 = only vertical)
-    [SerializeField] private float minimumEntryDistance = 0.2f; // Minimum distance from edge to allow entry
-    [SerializeField] private bool snapToValidPosition = true; // Snap to safe position when entering
+    [SerializeField] private bool restrictSideEntry = true;
+    [SerializeField] private bool requireGroundedForInversion = true;
+    [SerializeField] private float verticalEntryBias = 0.7f;
+    [SerializeField] private float minimumEntryDistance = 0.2f;
+    [SerializeField] private bool snapToValidPosition = true;
 
     [Header("Input Actions")]
     [SerializeField] private InputActionAsset actions;
@@ -48,39 +46,28 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private float pushForce = 2f;
     [SerializeField] private float pushCheckDistance = 0.5f;
 
-    [Header("Fluid Interaction")]
-    [SerializeField] private FluidSim2D fluidSim;
-    [SerializeField] private float fluidPushRadius = 1.5f;
-    [SerializeField] private bool enableFluidInteraction = true;
-    [SerializeField] private ParticleSystem splashEffect;
-    [SerializeField] private float splashThreshold = 3f;
-
-    [Header("Fluid Movement Modifiers")]
-    [SerializeField] private float fluidMoveSpeedMultiplier = 0.7f;
-    [SerializeField] private float fluidJumpMultiplier = 1.2f;
-    [SerializeField] private bool canSwimInMirroredState = true;
-
-    [Header("Player Fluid Control")]
-    [SerializeField] private bool enablePlayerFluidControl = true;
-    [SerializeField] private float playerFluidInteractionStrength = 10f;
-    [SerializeField] private float playerFluidInteractionRadius = 3f;
-    [SerializeField] private KeyCode fluidPullKey = KeyCode.Z;
-    [SerializeField] private KeyCode fluidPushKey = KeyCode.X;
-    [SerializeField] private bool requireFluidProximityForControl = true;
-    [SerializeField] private float fluidControlProximityRadius = 2f;
+    [Header("Afterimage Effect")]
+    [SerializeField] private AfterImageEffect afterImageEffect;
+    [SerializeField] private bool enableAfterimageInNormal = true;
+    [SerializeField] private bool enableAfterimageInMirrored = true;
+    [SerializeField] private float stateTransitionAfterimageTime = 2f;
+    [SerializeField] private float dashAfterimageTime = 1.5f;
+    [SerializeField] private KeyCode dashKey = KeyCode.LeftShift;
+    [SerializeField] private float dashForce = 15f;
+    [SerializeField] private float dashCooldown = 2f;
 
     // === Space Types ===
     public enum SpaceType
     {
         Normal,     // Regular world space
         BlackSpace, // Inverted/mirrored space
-        Fluid       // Water/fluid space
     }
 
     // === Runtime Components & State ===
     private Rigidbody2D rb;
     private SpriteRenderer sr;
     private CapsuleCollider2D cc;
+    private AudioSource audioSource;
     private IPlayerState currentState;
     private NormalState normalState;
     private MirroredState mirroredState;
@@ -88,34 +75,35 @@ public class PlayerManager : MonoBehaviour
     // === Cached Values ===
     private int blackSpaceLayer;
     private int solidLayerMask;
-    private bool isGrounded;
+    public bool isGrounded { get; private set; }
     private Vector2 currentNormal;
     private Vector2 entryPoint;
     private float lastFlipTime;
     private Vector2 lastPosition;
-    private float lastSplashTime;
+    private float lastDashTime;
+    private bool isDashing;
 
     // Space detection
     private SpaceType currentSpaceType;
     private SpaceType previousSpaceType;
     private bool isTransitioning;
 
-    // Fluid interaction tracking
-    private Vector2 velocityBuffer;
-    private bool wasInFluid;
-    private float fluidImpactForce;
-    private bool isInFluid;
-    private float timeInFluid;
-
-    private bool isFluidPulling;
-    private bool isFluidPushing;
-    private float fluidControlStrength;
-
     void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
         sr = GetComponent<SpriteRenderer>();
         cc = GetComponent<CapsuleCollider2D>();
+        audioSource = GetComponent<AudioSource>();
+
+        if (audioSource == null)
+            audioSource = gameObject.AddComponent<AudioSource>();
+
+        // Initialize afterimage effect
+        if (afterImageEffect == null)
+            afterImageEffect = GetComponent<AfterImageEffect>();
+
+        if (afterImageEffect == null)
+            afterImageEffect = gameObject.AddComponent<AfterImageEffect>();
 
         sr.sortingLayerName = "Player";
         sr.sortingOrder = 100;
@@ -131,15 +119,10 @@ public class PlayerManager : MonoBehaviour
         previousSpaceType = currentSpaceType;
 
         // Start in appropriate state based on initial space
-        TransitionTo(currentSpaceType == SpaceType.BlackSpace ? mirroredState : normalState);
+        IPlayerState initialState = GetStateForSpaceType(currentSpaceType);
+        TransitionTo(initialState);
 
         lastPosition = transform.position;
-
-        // Auto-find fluid sim if not assigned
-        if (fluidSim == null)
-        {
-            fluidSim = FindFirstObjectByType<FluidSim2D>();
-        }
     }
 
     void OnEnable() => actions?.Enable();
@@ -154,20 +137,14 @@ public class PlayerManager : MonoBehaviour
         HandleSpaceTransitions();
 
         currentState.HandleUpdate();
-        CheckFluidInteraction();
-
-        // NEW: Add this line to ensure fluid interaction is always updated
-        // (This provides a fallback in case states don't call it)
-        if (!currentState.GetType().Name.Contains("State"))
-        {
-            HandleFluidInteraction(); // Fallback call
-        }
     }
 
     void FixedUpdate()
     {
         currentState.HandleFixedUpdate();
-        UpdateVelocityTracking();
+
+        // Track position for effect triggers
+        lastPosition = transform.position;
     }
 
     // === Space Detection System ===
@@ -175,13 +152,7 @@ public class PlayerManager : MonoBehaviour
     {
         Vector2 playerPos = transform.position;
 
-        // Check for fluid first (highest priority)
-        if (IsInFluid())
-        {
-            return SpaceType.Fluid;
-        }
-
-        // Check if we're in black space with entry validation
+        // Check if we're in black space
         if (IsInValidBlackSpace())
         {
             return SpaceType.BlackSpace;
@@ -195,7 +166,6 @@ public class PlayerManager : MonoBehaviour
     {
         Vector2 playerPos = transform.position;
 
-        // Basic overlap check
         Collider2D blackSpaceCollider = Physics2D.OverlapCircle(
             playerPos,
             spaceCheckRadius,
@@ -205,35 +175,136 @@ public class PlayerManager : MonoBehaviour
         if (blackSpaceCollider == null)
             return false;
 
-        // If we're already in mirrored state, allow staying in black space
-        // but check if we should exit based on grounded status
         if (currentState == mirroredState)
         {
-            // If we require grounded for inversion, check if we're grounded in black space
             if (requireGroundedForInversion)
             {
                 bool isGroundedInBlackSpace = CheckMirroredGrounded();
-
-                // Stay in black space only if we're grounded in it OR we're transitioning
                 return isGroundedInBlackSpace || isTransitioning;
             }
             return true;
         }
 
-        // For new entries, always validate (this now includes grounded check)
         return ValidateBlackSpaceEntry(playerPos);
     }
 
-    private bool ValidateBlackSpaceEntry(Vector2 playerPos)
+    private IPlayerState GetStateForSpaceType(SpaceType spaceType)
     {
-        // First check if we're in fluid - prevent inversion in fluid
-        if (preventInversionInFluid && IsInFluid())
+        switch (spaceType)
         {
-            Debug.Log("Black space entry blocked - cannot invert while in fluid");
-            return false;
+            case SpaceType.Normal: return normalState;
+            case SpaceType.BlackSpace: return mirroredState;
+            default: return normalState;
+        }
+    }
+
+    // === Enhanced Space Transition Handling ===
+    private void HandleSpaceTransitions()
+    {
+        // Handle space transitions
+        if (currentSpaceType != previousSpaceType)
+        {
+            Debug.Log($"Space transition detected: {previousSpaceType} -> {currentSpaceType}");
+
+            // Activate cyberpunk afterimage during state transition with burst effect
+            if (afterImageEffect != null)
+            {
+                afterImageEffect.ActivateForDuration(stateTransitionAfterimageTime);
+                afterImageEffect.CreateCyberpunkBurst(12, 2f); // Epic transition effect
+            }
+
+            InitiateSpaceTransition(currentSpaceType);
+            previousSpaceType = currentSpaceType;
         }
 
-        // Then check grounded requirement if enabled
+        // Handle manual override if enabled
+        if (enableManualOverride && CanFlip() && Input.GetKeyDown(KeyCode.E))
+        {
+            ManualFlip();
+        }
+
+        // Handle dash input
+        HandleDashInput();
+    }
+
+    private void InitiateSpaceTransition(SpaceType newSpaceType)
+    {
+        IPlayerState targetState = GetStateForSpaceType(newSpaceType);
+
+        if (currentState != targetState)
+        {
+            // Special handling for black space entry validation
+            if (newSpaceType == SpaceType.BlackSpace && !TryEnterBlackSpaceImproved())
+            {
+                Debug.Log("Black space entry failed - invalid entry point");
+                return;
+            }
+
+            TransitionTo(targetState);
+            isTransitioning = true;
+        }
+    }
+
+    private void HandleDashInput()
+    {
+        if (Input.GetKeyDown(dashKey) && CanDash())
+        {
+            StartDash();
+        }
+    }
+
+    private bool CanDash()
+    {
+        return Time.time - lastDashTime >= dashCooldown && !isDashing;
+    }
+
+    private void StartDash()
+    {
+        lastDashTime = Time.time;
+        isDashing = true;
+
+        // Activate intense cyberpunk afterimage effect
+        if (afterImageEffect != null)
+        {
+            afterImageEffect.ActivateForDuration(dashAfterimageTime);
+
+            // Different effects for different states
+            if (currentState == mirroredState)
+            {
+                afterImageEffect.CreateCyberpunkBurst(8, 1.8f);
+            }
+            else
+            {
+                afterImageEffect.CreateCyberpunkBurst(6, 1.2f);
+            }
+        }
+
+        // Apply dash force
+        Vector2 dashDirection = sr.flipX ? Vector2.left : Vector2.right;
+        rb.AddForce(dashDirection * dashForce, ForceMode2D.Impulse);
+
+        // Stop dashing after a short time
+        StartCoroutine(EndDash());
+    }
+
+    private IEnumerator EndDash()
+    {
+        yield return new WaitForSeconds(0.2f);
+        isDashing = false;
+    }
+
+    // === State Interface ===
+    private interface IPlayerState
+    {
+        void Enter();
+        void Exit();
+        void HandleUpdate();
+        void HandleFixedUpdate();
+    }
+
+    // === Enhanced Validation ===
+    private bool ValidateBlackSpaceEntry(Vector2 playerPos)
+    {
         if (requireGroundedForInversion)
         {
             CheckGrounded();
@@ -244,7 +315,6 @@ public class PlayerManager : MonoBehaviour
             }
         }
 
-        // Then check entry direction and quality if side entry restriction is enabled
         if (restrictSideEntry)
         {
             EntryInfo entryInfo = FindBestEntryPoint(playerPos);
@@ -252,11 +322,9 @@ public class PlayerManager : MonoBehaviour
             if (!entryInfo.isValid)
                 return false;
 
-            // Prefer vertical entries over side entries
             float verticalComponent = Mathf.Abs(entryInfo.normal.y);
             if (verticalComponent < verticalEntryBias)
             {
-                // This is mostly a side entry, block it
                 Debug.Log("Black space entry blocked - side entry not allowed");
                 return false;
             }
@@ -271,7 +339,7 @@ public class PlayerManager : MonoBehaviour
         public Vector2 position;
         public Vector2 normal;
         public float distance;
-        public float quality; // 0-1, higher is better
+        public float quality;
     }
 
     private EntryInfo FindBestEntryPoint(Vector2 fromPos)
@@ -279,16 +347,10 @@ public class PlayerManager : MonoBehaviour
         EntryInfo bestEntry = new EntryInfo { isValid = false };
         float bestQuality = -1f;
 
-        // Check multiple directions, prioritizing vertical
         Vector2[] checkDirections = {
-            Vector2.down,    // Primary: down entry
-            Vector2.up,      // Secondary: up entry  
-            Vector2.left,    // Tertiary: side entries
-            Vector2.right,
-            new Vector2(-0.7f, -0.7f), // Diagonal entries
-            new Vector2(0.7f, -0.7f),
-            new Vector2(-0.7f, 0.7f),
-            new Vector2(0.7f, 0.7f)
+            Vector2.down, Vector2.up, Vector2.left, Vector2.right,
+            new Vector2(-0.7f, -0.7f), new Vector2(0.7f, -0.7f),
+            new Vector2(-0.7f, 0.7f), new Vector2(0.7f, 0.7f)
         };
 
         for (int i = 0; i < checkDirections.Length; i++)
@@ -298,14 +360,12 @@ public class PlayerManager : MonoBehaviour
 
             if (hit.collider != null && hit.collider.gameObject.layer == blackSpaceLayer)
             {
-                // Calculate entry quality based on direction preference and distance
-                float verticalBias = Mathf.Abs(dir.y); // Prefer vertical directions
-                float distanceQuality = 1f - (hit.distance / detectionRadius); // Prefer closer entries
+                float verticalBias = Mathf.Abs(dir.y);
+                float distanceQuality = 1f - (hit.distance / detectionRadius);
                 float quality = (verticalBias * 0.7f + distanceQuality * 0.3f);
 
-                // Apply priority bonus for down direction
-                if (i == 0) quality += 0.2f; // Down gets bonus
-                else if (i == 1) quality += 0.1f; // Up gets smaller bonus
+                if (i == 0) quality += 0.2f;
+                else if (i == 1) quality += 0.1f;
 
                 if (quality > bestQuality && hit.distance >= minimumEntryDistance)
                 {
@@ -325,69 +385,17 @@ public class PlayerManager : MonoBehaviour
         return bestEntry;
     }
 
-    private void HandleSpaceTransitions()
+    // === State Management ===
+    private void TransitionTo(IPlayerState next)
     {
-        // If space type changed, initiate transition
-        if (currentSpaceType != previousSpaceType)
-        {
-            Debug.Log($"Space transition detected: {previousSpaceType} -> {currentSpaceType}");
-            InitiateSpaceTransition(currentSpaceType);
-            previousSpaceType = currentSpaceType;
-        }
+        currentState?.Exit();
+        currentState = next;
+        currentState.Enter();
 
-        // Handle manual override if enabled
-        if (enableManualOverride && CanFlip() && Input.GetKeyDown(KeyCode.E))
-        {
-            ManualFlip();
-        }
-    }
-
-    private void InitiateSpaceTransition(SpaceType newSpaceType)
-    {
-        switch (newSpaceType)
-        {
-            case SpaceType.Normal:
-                if (currentState != normalState)
-                {
-                    TransitionTo(normalState);
-                }
-                break;
-
-            case SpaceType.BlackSpace:
-                if (currentState != mirroredState)
-                {
-                    // Use improved entry positioning
-                    if (TryEnterBlackSpaceImproved())
-                    {
-                        TransitionTo(mirroredState);
-                    }
-                    else
-                    {
-                        // Entry failed, stay in normal space
-                        Debug.Log("Black space entry failed - invalid entry point");
-                        return;
-                    }
-                }
-                break;
-
-            case SpaceType.Fluid:
-                // Fluid doesn't change the base state, but affects movement
-                break;
-        }
-
-        isTransitioning = true;
     }
 
     private bool TryEnterBlackSpaceImproved()
     {
-        // Check fluid restriction first
-        if (preventInversionInFluid && IsInFluid())
-        {
-            Debug.Log("Cannot enter black space - in fluid");
-            return false;
-        }
-
-        // Check grounded requirement
         if (requireGroundedForInversion)
         {
             CheckGrounded();
@@ -406,17 +414,15 @@ public class PlayerManager : MonoBehaviour
             return false;
         }
 
-        // Store entry information
         entryPoint = transform.position;
         currentNormal = entryInfo.normal;
 
-        // Position player at the entry point
         if (snapToValidPosition)
         {
             transform.position = entryInfo.position;
         }
 
-        Debug.Log($"Entering black space with quality {entryInfo.quality:F2}, normal {entryInfo.normal}, grounded: {isGrounded}");
+        Debug.Log($"Entering black space with quality {entryInfo.quality:F2}");
         return true;
     }
 
@@ -424,17 +430,8 @@ public class PlayerManager : MonoBehaviour
     {
         lastFlipTime = Time.time;
 
-        // Manual flip overrides automatic detection temporarily
         if (currentState == normalState)
         {
-            // Check fluid restriction for manual flip
-            if (preventInversionInFluid && IsInFluid())
-            {
-                Debug.Log("Cannot manually flip to black space - in fluid");
-                return;
-            }
-
-            // Check grounded requirement for manual flip
             if (requireGroundedForInversion)
             {
                 CheckGrounded();
@@ -445,7 +442,6 @@ public class PlayerManager : MonoBehaviour
                 }
             }
 
-            // Try to find black space to enter
             if (TryFindNearbyBlackSpace(out Vector2 entryPos, out Vector2 normal))
             {
                 transform.position = entryPos;
@@ -453,9 +449,8 @@ public class PlayerManager : MonoBehaviour
                 TransitionTo(mirroredState);
             }
         }
-        else
+        else if (currentState == mirroredState)
         {
-            // Check grounded requirement for manual exit
             if (requireGroundedForInversion)
             {
                 bool isGroundedInBlackSpace = CheckMirroredGrounded();
@@ -466,14 +461,10 @@ public class PlayerManager : MonoBehaviour
                 }
             }
 
-            // Exit to normal space
             Vector2 exitPos = FindExitPoint();
             transform.position = exitPos;
             TransitionTo(normalState);
         }
-
-        // Create a small splash effect when manually flipping
-        CreateSplashEffect();
     }
 
     private bool TryFindNearbyBlackSpace(out Vector2 entryPos, out Vector2 normal)
@@ -492,158 +483,6 @@ public class PlayerManager : MonoBehaviour
         return false;
     }
 
-    // === State Management ===
-    private void TransitionTo(IPlayerState next)
-    {
-        currentState?.Exit();
-        currentState = next;
-        currentState.Enter();
-    }
-
-    public bool IsInMirroredState()
-    {
-        return currentState == mirroredState;
-    }
-
-    public bool CanFlip() => Time.time - lastFlipTime >= flipCooldown;
-
-    public SpaceType GetCurrentSpaceType() => currentSpaceType;
-    public bool IsTransitioning() => isTransitioning;
-
-    // === Fluid Interaction (keeping your existing system) ===
-    void UpdateVelocityTracking()
-    {
-        Vector2 currentPos = transform.position;
-        velocityBuffer = (currentPos - lastPosition) / Time.fixedDeltaTime;
-        lastPosition = currentPos;
-    }
-
-    void CheckFluidInteraction()
-    {
-        if (!enableFluidInteraction) return;
-
-        bool wasInFluidPreviously = isInFluid;
-        isInFluid = IsInFluid();
-
-        if (isInFluid)
-        {
-            timeInFluid += Time.deltaTime;
-
-            // Create splash effect when entering fluid or moving fast
-            if ((!wasInFluidPreviously && rb.linearVelocity.magnitude > splashThreshold) ||
-                (Time.time - lastSplashTime > 1f && rb.linearVelocity.magnitude > splashThreshold * 1.5f))
-            {
-                CreateSplashEffect();
-                lastSplashTime = Time.time;
-            }
-
-            // NEW: Debug output for particle-based fluid detection
-            if (fluidSim != null && Time.frameCount % 60 == 0) // Every second
-            {
-                Debug.Log($"Player in fluid - Nearby particles: {fluidSim.GetNearbyParticleCount()}, " +
-                         $"Submersion depth: {fluidSim.GetPlayerSubmersionDepth():F2}");
-            }
-        }
-        else
-        {
-            timeInFluid = 0f;
-        }
-
-        wasInFluid = isInFluid;
-    }
-
-    bool IsInFluid()
-    {
-        // NEW: Use FluidSim2D's particle-based detection
-        if (fluidSim != null)
-        {
-            return fluidSim.IsPlayerInFluid();
-        }
-
-        // FALLBACK: Old proximity-based detection for other fluid objects
-        Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(transform.position, fluidPushRadius);
-        foreach (var collider in nearbyColliders)
-        {
-            if (collider.CompareTag("Fluid") || collider.name.Contains("Particle"))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    void CreateSplashEffect()
-    {
-        if (splashEffect != null && Time.time - lastSplashTime > 0.5f)
-        {
-            splashEffect.transform.position = transform.position;
-            splashEffect.Play();
-        }
-    }
-
-    // === Movement Property Getters ===
-    public Vector2 GetVelocity() => rb.linearVelocity;
-
-    public float GetMovementIntensity()
-    {
-        return Mathf.Clamp01(rb.linearVelocity.magnitude / (moveSpeed * 2f));
-    }
-
-    public float GetCurrentMoveSpeed()
-    {
-        if (IsInFluid())
-        {
-            // NEW: Scale movement based on submersion depth
-            float submersion = GetFluidSubmersionLevel();
-            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
-            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
-
-            // More submersion = more movement reduction
-            float fluidModifier = Mathf.Lerp(1f, fluidMoveSpeedMultiplier, submersionRatio);
-            return moveSpeed * fluidModifier;
-        }
-        return moveSpeed;
-    }
-
-    public float GetCurrentJumpForce()
-    {
-        if (IsInFluid())
-        {
-            // NEW: Scale jump based on submersion depth
-            float submersion = GetFluidSubmersionLevel();
-            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
-            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
-
-            // More submersion = more jump boost
-            float fluidModifier = Mathf.Lerp(1f, fluidJumpMultiplier, submersionRatio);
-            return jumpForce * fluidModifier;
-        }
-        return jumpForce;
-    }
-
-    public bool CanSwim()
-    {
-        if (!IsInFluid()) return false;
-
-        // NEW: Require minimum submersion to swim
-        float submersion = GetFluidSubmersionLevel();
-        float minSubmersionForSwimming = 0.5f; // Minimum depth needed to swim
-
-        return submersion >= minSubmersionForSwimming &&
-               IsInMirroredState() &&
-               canSwimInMirroredState;
-    }
-
-    // === State Interface ===
-    private interface IPlayerState
-    {
-        void Enter();
-        void Exit();
-        void HandleUpdate();
-        void HandleFixedUpdate();
-    }
-
     // === Normal Movement State ===
     private class NormalState : IPlayerState
     {
@@ -654,12 +493,20 @@ public class PlayerManager : MonoBehaviour
         public void Enter()
         {
             pm.rb.gravityScale = 1;
+            pm.rb.drag = 0f;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
 
-            // Smooth transition to upright
             if (pm.maintainUpright)
             {
                 pm.StartCoroutine(pm.SmoothRotationTransition(Quaternion.identity));
+            }
+
+            // Configure cyberpunk afterimage for normal state
+            if (pm.afterImageEffect != null && pm.enableAfterimageInNormal)
+            {
+                pm.afterImageEffect.SetSpawnRate(0.12f);
+                pm.afterImageEffect.SetFadeTime(0.8f);
+                pm.afterImageEffect.SetColorCount(4); // Less intense in normal state
             }
 
             Debug.Log("Player entered normal state");
@@ -674,22 +521,30 @@ public class PlayerManager : MonoBehaviour
 
             pm.CheckGrounded();
 
-            if (Input.GetKeyDown(KeyCode.Space))
+            // Handle continuous afterimage based on speed
+            if (pm.afterImageEffect != null && pm.enableAfterimageInNormal)
             {
-                if (pm.isGrounded || (pm.isInFluid && pm.timeInFluid > 0.1f))
-                {
-                    float jumpForce = pm.GetCurrentJumpForce();
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpForce);
+                float velocityMagnitude = pm.rb.velocity.magnitude;
 
-                    if (pm.isInFluid)
-                    {
-                        pm.CreateSplashEffect();
-                    }
+                // Auto-activate afterimage when moving fast
+                if (velocityMagnitude > 8f && !pm.afterImageEffect.IsEffectActive())
+                {
+                    pm.afterImageEffect.ActivateEffect();
+                }
+                else if (velocityMagnitude < 3f && pm.afterImageEffect.IsEffectActive())
+                {
+                    pm.afterImageEffect.DeactivateEffect();
                 }
             }
 
-            // NEW: Add fluid interaction handling
-            pm.HandleFluidInteraction();
+            if (Input.GetKeyDown(KeyCode.Space))
+            {
+                if (pm.isGrounded)
+                {
+                    float jumpForce = pm.GetCurrentJumpForce();
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x, jumpForce);
+                }
+            }
 
             HandlePushInteraction();
         }
@@ -698,7 +553,14 @@ public class PlayerManager : MonoBehaviour
         {
             input.x = Input.GetAxisRaw("Horizontal");
             float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
+
+            // Increase speed while dashing
+            if (pm.isDashing)
+            {
+                currentMoveSpeed *= 1.5f;
+            }
+
+            pm.rb.velocity = new Vector2(input.x * currentMoveSpeed, pm.rb.velocity.y);
 
             Vector2 normal = pm.DetectGroundNormal();
             if (pm.maintainUpright) pm.RotateToMatchNormal(normal);
@@ -721,7 +583,7 @@ public class PlayerManager : MonoBehaviour
                 if (objRb != null && objRb.bodyType == RigidbodyType2D.Dynamic)
                 {
                     objRb.AddForce(pushDirection * pm.pushForce, ForceMode2D.Force);
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x * 0.7f, pm.rb.linearVelocity.y);
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x * 0.7f, pm.rb.velocity.y);
                 }
             }
         }
@@ -735,16 +597,25 @@ public class PlayerManager : MonoBehaviour
 
         public MirroredState(PlayerManager pm) => this.pm = pm;
 
+
         public void Enter()
         {
             pm.rb.gravityScale = -1f;
-            pm.rb.linearVelocity = Vector2.zero;
+            pm.rb.drag = 0f;
+            pm.rb.velocity = Vector2.zero;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
 
-            // Smooth transition to inverted
             if (pm.maintainUpright)
             {
                 pm.StartCoroutine(pm.SmoothRotationTransition(Quaternion.Euler(0, 0, 180)));
+            }
+
+            // Configure cyberpunk afterimage for mirrored state - MORE INTENSE
+            if (pm.afterImageEffect != null && pm.enableAfterimageInMirrored)
+            {
+                pm.afterImageEffect.SetSpawnRate(0.06f); // Faster spawning
+                pm.afterImageEffect.SetFadeTime(1.5f); // Longer lasting
+                pm.afterImageEffect.SetColorCount(8); // Full rainbow effect
             }
 
             Debug.Log("Player entered mirrored state");
@@ -754,6 +625,14 @@ public class PlayerManager : MonoBehaviour
         {
             pm.rb.gravityScale = 1f;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
+
+            // Reset cyberpunk afterimage settings
+            if (pm.afterImageEffect != null)
+            {
+                pm.afterImageEffect.SetSpawnRate(0.1f);
+                pm.afterImageEffect.SetFadeTime(0.8f);
+                pm.afterImageEffect.SetColorCount(4);
+            }
         }
 
         public void HandleUpdate()
@@ -763,40 +642,48 @@ public class PlayerManager : MonoBehaviour
 
             bool isGroundedInBlackSpace = pm.CheckMirroredGrounded();
 
-            if (Input.GetKeyDown(KeyCode.Space))
+            // Handle continuous afterimage in mirrored state
+            if (pm.afterImageEffect != null && pm.enableAfterimageInMirrored)
             {
-                if (isGroundedInBlackSpace || pm.CanSwim())
-                {
-                    float jumpForce = pm.GetCurrentJumpForce();
-                    Vector2 jumpDirection = pm.CanSwim() ? Vector2.up : Vector2.down;
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpDirection.y * jumpForce);
+                float velocityMagnitude = pm.rb.velocity.magnitude;
 
-                    if (pm.isInFluid)
-                    {
-                        pm.CreateSplashEffect();
-                    }
+                // In mirrored state, activate afterimage more easily
+                if (velocityMagnitude > 4f && !pm.afterImageEffect.IsEffectActive())
+                {
+                    pm.afterImageEffect.ActivateEffect();
+                }
+                else if (velocityMagnitude < 2f && pm.afterImageEffect.IsEffectActive())
+                {
+                    pm.afterImageEffect.DeactivateEffect();
                 }
             }
 
-            // NEW: Add fluid interaction handling
-            pm.HandleFluidInteraction();
+            if (Input.GetKeyDown(KeyCode.Space))
+            {
+                if (isGroundedInBlackSpace)
+                {
+                    float jumpForce = pm.GetCurrentJumpForce();
+                    // FIXED: In mirrored state with negative gravity, jump force should be negative to go "up"
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x, -jumpForce);
+                    Debug.Log($"Mirrored jump applied: {-jumpForce}");
+                }
+            }
         }
 
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
             float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
 
-            if (pm.CanSwim())
+            // Increase speed while dashing (even faster in mirrored state)
+            if (pm.isDashing)
             {
-                pm.transform.rotation = Quaternion.Slerp(
-                    pm.transform.rotation,
-                    Quaternion.Euler(0, 0, 0),
-                    Time.deltaTime * pm.rotationSpeed
-                );
+                currentMoveSpeed *= 2f; // Extra speed boost in mirrored state
             }
-            else if (pm.maintainUpright)
+
+            pm.rb.velocity = new Vector2(input.x * currentMoveSpeed, pm.rb.velocity.y);
+
+            if (pm.maintainUpright)
             {
                 pm.transform.rotation = Quaternion.Slerp(
                     pm.transform.rotation,
@@ -807,31 +694,33 @@ public class PlayerManager : MonoBehaviour
 
             pm.sr.color = Color.Lerp(pm.sr.color, pm.mirroredColor, Time.deltaTime * 10f);
         }
+    }
 
-        private void HandlePlayerFluidControls()
-        {
-            pm.HandleFluidInteraction();
+    // === Public API ===
+    public bool IsInMirroredState() => currentState == mirroredState;
+    public bool CanFlip() => Time.time - lastFlipTime >= flipCooldown;
+    public SpaceType GetCurrentSpaceType() => currentSpaceType;
+    public bool IsTransitioning() => isTransitioning;
 
-            // Optional: Visual feedback for fluid control
-            if (pm.IsPlayerControllingFluid())
-            {
-                // You could add particle effects, screen shake, or other feedback here
-                if (pm.isFluidPulling)
-                {
-                    // Visual feedback for pulling
-                    Debug.Log("Player pulling fluid");
-                }
-                else if (pm.isFluidPushing)
-                {
-                    // Visual feedback for pushing  
-                    Debug.Log("Player pushing fluid");
-                }
-            }
-        }
+    public Vector2 GetVelocity() => rb.velocity;
+    public float GetMovementIntensity() => Mathf.Clamp01(rb.velocity.magnitude / (moveSpeed * 2f));
+
+    public float GetCurrentMoveSpeed()
+    {
+        float baseSpeed = moveSpeed;
+
+        return baseSpeed;
+    }
+
+    public float GetCurrentJumpForce()
+    {
+        float baseJump = jumpForce;
+
+        return baseJump;
     }
 
     // === Helper Coroutines ===
-    private System.Collections.IEnumerator SmoothRotationTransition(Quaternion targetRotation)
+    private IEnumerator SmoothRotationTransition(Quaternion targetRotation)
     {
         Quaternion startRotation = transform.rotation;
         float elapsed = 0f;
@@ -848,12 +737,11 @@ public class PlayerManager : MonoBehaviour
         isTransitioning = false;
     }
 
-    // === Utility Functions (keeping your existing ones) ===
+    // === Utility Functions ===
     private bool CheckMirroredGrounded()
     {
         RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.up, 0.2f, 1 << blackSpaceLayer);
-        bool isOnBlackSpace = hit.collider != null;
-        return isOnBlackSpace;
+        return hit.collider != null;
     }
 
     private void CheckGrounded()
@@ -864,8 +752,7 @@ public class PlayerManager : MonoBehaviour
 
     private Vector2 DetectGroundNormal()
     {
-        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position,
-                                             Vector2.down, 1f, solidLayerMask);
+        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.down, 1f, solidLayerMask);
         return hit ? hit.normal : Vector2.up;
     }
 
@@ -879,7 +766,6 @@ public class PlayerManager : MonoBehaviour
 
     private Vector2 FindExitPoint()
     {
-        // Find nearest normal space
         Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(
             transform.position,
             detectionRadius,
@@ -888,7 +774,6 @@ public class PlayerManager : MonoBehaviour
 
         if (nearbyColliders.Length > 0)
         {
-            // Find the closest normal space
             float closestDist = Mathf.Infinity;
             Vector2 closestPoint = transform.position;
 
@@ -907,200 +792,11 @@ public class PlayerManager : MonoBehaviour
             return closestPoint;
         }
 
-        // Fallback: move up and out
         return transform.position + Vector3.up * edgeFollowDistance * 2f;
     }
 
-    public bool IsInFluidArea()
+    public bool IsGrounded()
     {
-        return IsInFluid();
+        return isGrounded;
     }
-
-    public float GetFluidSubmersionLevel()
-    {
-        if (fluidSim != null)
-        {
-            return fluidSim.GetPlayerSubmersionDepth();
-        }
-        return 0f;
-    }
-
-    public int GetNearbyFluidParticleCount()
-    {
-        if (fluidSim != null)
-        {
-            return fluidSim.GetNearbyParticleCount();
-        }
-        return 0;
-    }
-
-    private void HandleFluidInteraction()
-    {
-        if (!enablePlayerFluidControl || !enableFluidInteraction)
-        {
-            isFluidPulling = false;
-            isFluidPushing = false;
-            fluidControlStrength = 0f;
-            return;
-        }
-
-        // Check if player is near fluid (if required)
-        if (requireFluidProximityForControl)
-        {
-            bool nearFluid = false;
-
-            if (fluidSim != null)
-            {
-                // Check if player is within control proximity of fluid
-                Vector2 playerPos = transform.position;
-
-                // Use the cached particle positions from FluidSim2D if available
-                if (fluidSim.positionBuffer != null && fluidSim.numParticles > 0)
-                {
-                    // We'll check this through the fluid sim's existing methods
-                    nearFluid = IsInFluid() || GetDistanceToNearestFluidParticle() <= fluidControlProximityRadius;
-                }
-            }
-
-            if (!nearFluid)
-            {
-                isFluidPulling = false;
-                isFluidPushing = false;
-                fluidControlStrength = 0f;
-                return;
-            }
-        }
-
-        // Handle input
-        isFluidPulling = Input.GetKey(fluidPullKey);
-        isFluidPushing = Input.GetKey(fluidPushKey);
-
-        // Calculate interaction strength
-        if (isFluidPushing || isFluidPulling)
-        {
-            fluidControlStrength = isFluidPushing ? -playerFluidInteractionStrength : playerFluidInteractionStrength;
-
-            // Modify strength based on player state
-            if (IsInMirroredState())
-            {
-                fluidControlStrength *= 1.3f; // Stronger interaction in mirrored state
-            }
-
-            // Reduce strength if player is moving fast to prevent overpowered effects
-            float movementFactor = Mathf.Clamp01(2f - (rb.linearVelocity.magnitude / moveSpeed));
-            fluidControlStrength *= movementFactor;
-        }
-        else
-        {
-            fluidControlStrength = 0f;
-        }
-    }
-
-    // Add this helper method:
-    private float GetDistanceToNearestFluidParticle()
-    {
-        if (fluidSim == null) return float.MaxValue;
-
-        // This is a simplified check - in a full implementation, you'd want to 
-        // check against actual particle positions, but this gives a reasonable approximation
-        Vector2 playerPos = transform.position;
-
-        // Check if we're in the general fluid area
-        if (fluidSim.IsPlayerInFluid())
-        {
-            return 0f; // Already in fluid
-        }
-
-        // For now, return a reasonable estimate based on fluid detection radius
-        return fluidSim.fluidDetectionRadius;
-    }
-
-    // Add these public methods for FluidSim2D to query:
-    public bool IsPlayerControllingFluid()
-    {
-        return enablePlayerFluidControl && (isFluidPulling || isFluidPushing);
-    }
-
-    public float GetPlayerFluidControlStrength()
-    {
-        return fluidControlStrength;
-    }
-
-    public float GetPlayerFluidControlRadius()
-    {
-        return playerFluidInteractionRadius;
-    }
-
-    public Vector2 GetPlayerFluidControlPosition()
-    {
-        return transform.position;
-    }
-
-    public float GetCurrentPlayerInteractionStrength()
-    {
-        return playerFluidInteractionStrength;
-    }
-
-    /*
-// ==== OPTIONAL: Enhanced debug gizmos ====
-void OnDrawGizmosSelected()
-{
-    if (!Application.isPlaying) return;
-
-    // Existing gizmos...
-    
-    // NEW: Draw fluid detection status
-    if (enableFluidInteraction && fluidSim != null)
-    {
-        Vector3 playerPos = transform.position;
-        
-        // Draw fluid detection radius
-        Gizmos.color = IsInFluid() ? Color.cyan : Color.gray;
-        if (fluidSim.useParticleBasedDetection)
-        {
-            Gizmos.DrawWireSphere(playerPos, fluidSim.fluidDetectionRadius);
-        }
-        
-        // Draw submersion depth indicator
-        float submersion = GetFluidSubmersionLevel();
-        if (submersion > 0f)
-        {
-            Gizmos.color = new Color(0, 0, 1, 0.3f);
-            Gizmos.DrawWireSphere(playerPos, submersion);
-            
-            // Draw submersion bar
-            Gizmos.color = Color.blue;
-            Vector3 barStart = playerPos + Vector3.right * 1f;
-            Vector3 barEnd = barStart + Vector3.up * submersion;
-            Gizmos.DrawLine(barStart, barEnd);
-            Gizmos.DrawWireCube(barEnd, Vector3.one * 0.1f);
-        }
-        
-        // Draw particle count indicator
-        int particleCount = GetNearbyFluidParticleCount();
-        if (particleCount > 0)
-        {
-            Gizmos.color = Color.yellow;
-            for (int i = 0; i < Mathf.Min(particleCount, 10); i++)
-            {
-                float angle = (i / 10f) * 360f * Mathf.Deg2Rad;
-                Vector3 offset = new Vector3(Mathf.Cos(angle), Mathf.Sin(angle)) * 0.5f;
-                Gizmos.DrawWireCube(playerPos + Vector3.up * 0.8f + offset, Vector3.one * 0.05f);
-            }
-        }
-    }
-
-#if UNITY_EDITOR
-    // Enhanced debug text
-    Vector3 textPos = transform.position + Vector3.up * 2f;
-    UnityEditor.Handles.Label(textPos, 
-        $"Space: {currentSpaceType}\n" +
-        $"In Fluid: {IsInFluid()}\n" +
-        $"Submersion: {GetFluidSubmersionLevel():F2}\n" +
-        $"Particles: {GetNearbyFluidParticleCount()}\n" +
-        $"Can Swim: {CanSwim()}");
-#endif
-}
-*/
-
 }
