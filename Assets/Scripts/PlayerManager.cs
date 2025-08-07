@@ -56,6 +56,14 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private float dashForce = 15f;
     [SerializeField] private float dashCooldown = 2f;
 
+    [Header("Afterimage Control")]
+    [SerializeField] private bool enableAutomaticAfterimage = true; // Toggle automatic activation
+    [SerializeField] private bool onlyActivateOnDash = false; // Only activate during dash
+    [SerializeField] private KeyCode manualAfterimageKey = KeyCode.Q; // Manual toggle key
+    [SerializeField] private float horizontalSpeedThresholdNormal = 8f; // Threshold for normal state
+    [SerializeField] private float horizontalSpeedThresholdMirrored = 6f; // Threshold for mirrored state
+
+
     // === Space Types ===
     public enum SpaceType
     {
@@ -521,19 +529,15 @@ public class PlayerManager : MonoBehaviour
 
             pm.CheckGrounded();
 
-            // Handle continuous afterimage based on speed
-            if (pm.afterImageEffect != null && pm.enableAfterimageInNormal)
-            {
-                float velocityMagnitude = pm.rb.velocity.magnitude;
+            // Handle afterimage activation
+            HandleAfterimageActivation();
 
-                // Auto-activate afterimage when moving fast
-                if (velocityMagnitude > 8f && !pm.afterImageEffect.IsEffectActive())
+            // Manual afterimage toggle
+            if (Input.GetKeyDown(pm.manualAfterimageKey))
+            {
+                if (pm.afterImageEffect != null)
                 {
-                    pm.afterImageEffect.ActivateEffect();
-                }
-                else if (velocityMagnitude < 3f && pm.afterImageEffect.IsEffectActive())
-                {
-                    pm.afterImageEffect.DeactivateEffect();
+                    pm.afterImageEffect.ToggleEffect();
                 }
             }
 
@@ -547,6 +551,35 @@ public class PlayerManager : MonoBehaviour
             }
 
             HandlePushInteraction();
+        }
+
+        private void HandleAfterimageActivation()
+        {
+            if (pm.afterImageEffect == null || !pm.enableAfterimageInNormal)
+                return;
+
+            // If only dash mode is enabled, don't do automatic activation
+            if (pm.onlyActivateOnDash)
+                return;
+
+            // If automatic afterimage is disabled, don't activate automatically
+            if (!pm.enableAutomaticAfterimage)
+                return;
+
+            float horizontalSpeed = Mathf.Abs(pm.rb.velocity.x);
+            bool isMovingFast = horizontalSpeed > pm.horizontalSpeedThresholdNormal;
+            bool isDashingNow = pm.isDashing;
+
+            // Activate conditions
+            if ((isMovingFast || isDashingNow) && !pm.afterImageEffect.IsEffectActive())
+            {
+                pm.afterImageEffect.ActivateEffect();
+            }
+            // Deactivate conditions
+            else if (horizontalSpeed < 2f && !isDashingNow && pm.afterImageEffect.IsEffectActive())
+            {
+                pm.afterImageEffect.DeactivateEffect();
+            }
         }
 
         public void HandleFixedUpdate()
@@ -642,19 +675,15 @@ public class PlayerManager : MonoBehaviour
 
             bool isGroundedInBlackSpace = pm.CheckMirroredGrounded();
 
-            // Handle continuous afterimage in mirrored state
-            if (pm.afterImageEffect != null && pm.enableAfterimageInMirrored)
-            {
-                float velocityMagnitude = pm.rb.velocity.magnitude;
+            // Handle afterimage activation
+            HandleAfterimageActivationMirrored();
 
-                // In mirrored state, activate afterimage more easily
-                if (velocityMagnitude > 4f && !pm.afterImageEffect.IsEffectActive())
+            // Manual afterimage toggle
+            if (Input.GetKeyDown(pm.manualAfterimageKey))
+            {
+                if (pm.afterImageEffect != null)
                 {
-                    pm.afterImageEffect.ActivateEffect();
-                }
-                else if (velocityMagnitude < 2f && pm.afterImageEffect.IsEffectActive())
-                {
-                    pm.afterImageEffect.DeactivateEffect();
+                    pm.afterImageEffect.ToggleEffect();
                 }
             }
 
@@ -663,10 +692,37 @@ public class PlayerManager : MonoBehaviour
                 if (isGroundedInBlackSpace)
                 {
                     float jumpForce = pm.GetCurrentJumpForce();
-                    // FIXED: In mirrored state with negative gravity, jump force should be negative to go "up"
                     pm.rb.velocity = new Vector2(pm.rb.velocity.x, -jumpForce);
                     Debug.Log($"Mirrored jump applied: {-jumpForce}");
                 }
+            }
+        }
+
+        private void HandleAfterimageActivationMirrored()
+        {
+            if (pm.afterImageEffect == null || !pm.enableAfterimageInMirrored)
+                return;
+
+            // If only dash mode is enabled, don't do automatic activation
+            if (pm.onlyActivateOnDash)
+                return;
+
+            // If automatic afterimage is disabled, don't activate automatically
+            if (!pm.enableAutomaticAfterimage)
+                return;
+
+            float horizontalSpeed = Mathf.Abs(pm.rb.velocity.x);
+            bool isMovingFast = horizontalSpeed > pm.horizontalSpeedThresholdMirrored;
+            bool isDashingNow = pm.isDashing;
+
+            // In mirrored state, activate afterimage more easily
+            if ((isMovingFast || isDashingNow) && !pm.afterImageEffect.IsEffectActive())
+            {
+                pm.afterImageEffect.ActivateEffect();
+            }
+            else if (horizontalSpeed < 1.5f && !isDashingNow && pm.afterImageEffect.IsEffectActive())
+            {
+                pm.afterImageEffect.DeactivateEffect();
             }
         }
 
