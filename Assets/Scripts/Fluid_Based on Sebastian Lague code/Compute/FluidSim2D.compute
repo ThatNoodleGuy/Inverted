@@ -39,7 +39,7 @@ float SmoothingKernelPoly6(float dst, float radius)
 {
     if (dst < radius)
     {
-        float scale = 315.0 / (64.0 * 3.14159 * pow(radius, 9));
+        float scale = 315.0 / (64.0 * 3.14159 * pow(abs(radius), 9));
         float v = radius * radius - dst * dst;
         return v * v * v * scale;
     }
@@ -50,7 +50,7 @@ float SpikyKernelPow2(float dst, float radius)
 {
     if (dst < radius)
     {
-        float scale = 6.0 / (3.14159 * pow(radius, 4));
+        float scale = 6.0 / (3.14159 * pow(abs(radius), 4));
         float v = radius - dst;
         return v * v * scale;
     }
@@ -61,7 +61,7 @@ float SpikyKernelPow3(float dst, float radius)
 {
     if (dst < radius)
     {
-        float scale = 10.0 / (3.14159 * pow(radius, 5));
+        float scale = 10.0 / (3.14159 * pow(abs(radius), 5));
         float v = radius - dst;
         return v * v * v * scale;
     }
@@ -72,7 +72,7 @@ float DerivativeSpikyPow2(float dst, float radius)
 {
     if (dst <= radius && dst > 0)
     {
-        float scale = 12.0 / (3.14159 * pow(radius, 4));
+        float scale = 12.0 / (3.14159 * pow(abs(radius), 4));
         float v = radius - dst;
         return -v * scale;
     }
@@ -83,7 +83,7 @@ float DerivativeSpikyPow3(float dst, float radius)
 {
     if (dst <= radius && dst > 0)
     {
-        float scale = 30.0 / (3.14159 * pow(radius, 5));
+        float scale = 30.0 / (3.14159 * pow(abs(radius), 5));
         float v = radius - dst;
         return -v * v * scale;
     }

@@ -25,14 +25,14 @@ public class FluidSim2D : MonoBehaviour
 	[Header("Boundary Settings")]
 	public CompositeCollider2D boundaryComposite;
 	[Tooltip("The margin within which particles will react to the boundary. Increase this to prevent leaking.")]
-	public float boundaryCollisionMargin = 0.5f; // INCREASED from 0.2f
-	public bool invertBoundary = true;
+	public float boundaryCollisionMargin = 0.3f;
+	public bool invertBoundary = false;
 	[Tooltip("Stronger collision response to prevent leaking")]
-	public float collisionResponseStrength = 2.5f; // INCREASED from 1.5f
+	public float collisionResponseStrength = 4.0f;
 	[Tooltip("Additional penetration correction factor")]
-	public float penetrationCorrectionFactor = 1.5f; // NEW
+	public float penetrationCorrectionFactor = 3.0f;
 	[Tooltip("Maximum allowed penetration before emergency correction")]
-	public float maxPenetration = 0.3f;
+	public float maxPenetration = 0.05f;
 
 	[Header("Particle Spawn Filtering")]
 	[Tooltip("Enable boundary-based particle filtering at spawn")]
@@ -204,9 +204,9 @@ public class FluidSim2D : MonoBehaviour
 		// if you forgot to hook it up in the Inspector, grab it now:
 		if (boundaryComposite == null)
 		{
-			var blackSpaceGO = GameObject.FindWithTag("BlackSpace");
-			if (blackSpaceGO != null)
-				boundaryComposite = blackSpaceGO.GetComponent<CompositeCollider2D>();
+			var invertedSpaceGO = GameObject.FindWithTag("InvertedSpace");
+			if (invertedSpaceGO != null)
+				boundaryComposite = invertedSpaceGO.GetComponent<CompositeCollider2D>();
 		}
 	}
 
@@ -378,19 +378,9 @@ public class FluidSim2D : MonoBehaviour
 
 				if (shouldKeep)
 				{
-					// Less aggressive distance check - only filter if very close to boundary
-					float distToBoundary = GetDistanceToNearestBoundary(candidate);
-
-					// Use the less aggressive minimum spawn distance
-					if (distToBoundary > minSpawnDistanceFromBoundary)
-					{
-						validParticles.Add(candidate);
-						validVelocities.Add(spawnData.velocities[i]);
-					}
-					else
-					{
-						filteredCount++;
-					}
+					// Skip expensive distance-to-boundary calculation – GPU collision will handle this.
+					validParticles.Add(candidate);
+					validVelocities.Add(spawnData.velocities[i]);
 				}
 				else
 				{

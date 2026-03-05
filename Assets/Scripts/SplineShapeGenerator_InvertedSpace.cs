@@ -7,7 +7,7 @@ using UnityEngine.Splines;
 using Unity.Mathematics;
 
 [RequireComponent(typeof(Rigidbody2D))]
-public class SplineShapeGenerator_BlackSpace : MonoBehaviour
+public class SplineShapeGenerator_InvertedSpace : MonoBehaviour
 {
     [SerializeField] private PhysicsMaterial2D physicsMaterial;
     [SerializeField] private float splineSamplingResolution = 0.1f;
@@ -23,7 +23,7 @@ public class SplineShapeGenerator_BlackSpace : MonoBehaviour
         GameObject splineObj = new GameObject("SquareSpline");
         splineObj.transform.SetParent(transform);
         splineObj.transform.localPosition = Vector3.zero;
-        splineObj.gameObject.layer = LayerMask.NameToLayer("BlackSpace");
+        splineObj.gameObject.layer = LayerMask.NameToLayer("InvertedSpace");
 
         // Add a SplineContainer component
         SplineContainer container = splineObj.AddComponent<SplineContainer>();
@@ -54,7 +54,7 @@ public class SplineShapeGenerator_BlackSpace : MonoBehaviour
         GameObject splineObj = new GameObject("CircleSpline");
         splineObj.transform.SetParent(transform);
         splineObj.transform.localPosition = Vector3.zero;
-        splineObj.gameObject.layer = LayerMask.NameToLayer("BlackSpace");
+        splineObj.gameObject.layer = LayerMask.NameToLayer("InvertedSpace");
 
         // Add a SplineContainer component
         SplineContainer container = splineObj.AddComponent<SplineContainer>();

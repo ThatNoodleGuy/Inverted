@@ -2,10 +2,11 @@
 %TAG !u! tag:unity3d.com,2011:
 --- !u!78 &1
 TagManager:
-  serializedVersion: 3
+  serializedVersion: 2
   tags:
   - Fluid
   - BlackSpace
+  - InvertedSpace
   layers:
   - Default
   - TransparentFX
@@ -17,7 +18,7 @@ TagManager:
   - BlackSpace
   - WorldSpace
   - Fluid
-  - 
+  - InvertedSpace
   - 
   - 
   - 
@@ -46,5 +47,12 @@ TagManager:
   - name: WaterParticles
     uniqueID: 3728330473
     locked: 0
-  m_RenderingLayers:
-  - Default
+  - name: Background
+    uniqueID: 3829340237
+    locked: 0
+  - name: Water
+    uniqueID: 4007607411
+    locked: 0
+  - name: Characters
+    uniqueID: 4254085485
+    locked: 0

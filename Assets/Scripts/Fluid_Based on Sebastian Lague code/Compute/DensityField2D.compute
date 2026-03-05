@@ -7,6 +7,10 @@ uint NumParticles;
 float SmoothingRadius;
 float DensityScale = 1.0;
 
+// World-space bounds of the density field
+float2 FieldMin; // bottom-left in world space
+float2 FieldMax; // top-right in world space
+
 // Output texture (now with depth=2)
 RWTexture3D<float> DensityTexture;
 
@@ -17,10 +21,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     uint width, height, depth;
     DensityTexture.GetDimensions(width, height, depth);
     
-    // Convert texture coordinates to world space (assuming -1 to 1 range)
-    float2 worldPos;
-    worldPos.x = ((float)id.x / width) * 2.0 - 1.0;
-    worldPos.y = ((float)id.y / height) * 2.0 - 1.0;
+    // Convert texture coordinates to world space using provided bounds
+    float2 uv;
+    uv.x = ((float)id.x + 0.5f) / (float)width;
+    uv.y = ((float)id.y + 0.5f) / (float)height;
+    
+    float2 worldPos = lerp(FieldMin, FieldMax, uv);
     
     float density = 0.0;
     

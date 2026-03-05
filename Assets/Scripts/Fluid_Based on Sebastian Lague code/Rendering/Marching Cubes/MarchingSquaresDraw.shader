@@ -6,11 +6,15 @@ Shader "Fluid/MarchingSquaresDraw"
 	}
 	SubShader
 	{
-		Tags { "RenderType"="Opaque" }
+		// Render as transparent so the player remains visible through the water
+		Tags { "RenderType"="Transparent" "Queue"="Transparent" }
 		LOD 100
 
 		Pass
 		{
+			ZWrite Off
+			Blend SrcAlpha OneMinusSrcAlpha
+
 			CGPROGRAM
 			#pragma vertex vert
 			#pragma fragment frag

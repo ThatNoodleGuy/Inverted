@@ -53,12 +53,36 @@ public class MarchingSquaresFluidRenderer : MonoBehaviour
     
     void UpdateDensityField()
     {
+        if (fluidSim2D == null || fluidSim2D.positionBuffer == null || fluidSim2D.densityBuffer == null)
+        {
+            return;
+        }
+
+        // Derive world-space bounds from the fluid boundary if available
+        Vector2 fieldMin = Vector2.zero;
+        Vector2 fieldMax = Vector2.one;
+
+        if (fluidSim2D.boundaryComposite != null)
+        {
+            var b = fluidSim2D.boundaryComposite.bounds;
+            fieldMin = b.min;
+            fieldMax = b.max;
+
+            // Keep world scale roughly in sync with fluid bounds
+            worldScale = b.size;
+
+            // Position this renderer at the centre of the fluid region
+            transform.position = b.center;
+        }
+
         // Set up compute shader parameters
         densityFieldCompute.SetBuffer(0, "Positions", fluidSim2D.positionBuffer);
         densityFieldCompute.SetBuffer(0, "Densities", fluidSim2D.densityBuffer);
         densityFieldCompute.SetTexture(0, "DensityTexture", densityTexture);
         densityFieldCompute.SetInt("NumParticles", fluidSim2D.numParticles);
         densityFieldCompute.SetFloat("SmoothingRadius", fluidSim2D.smoothingRadius);
+        densityFieldCompute.SetVector("FieldMin", fieldMin);
+        densityFieldCompute.SetVector("FieldMax", fieldMax);
         
         // Dispatch the compute shader
         int threadGroupsX = Mathf.CeilToInt(textureResolution / 8.0f);
