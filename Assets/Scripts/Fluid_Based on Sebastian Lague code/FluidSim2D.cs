@@ -12,7 +12,7 @@ public class FluidSim2D : MonoBehaviour
 
 	[Header("Simulation Settings")]
 	public float timeScale = 1;
-	public float maxTimestepFPS = 60;
+	public float maxTimestepFPS = 240f;
 	public int iterationsPerFrame;
 	public float gravity;
 	[Range(0, 1)] public float collisionDamping = 0.95f;
@@ -24,11 +24,23 @@ public class FluidSim2D : MonoBehaviour
 
 	[Header("Boundary Settings")]
 	public CompositeCollider2D boundaryComposite;
-	[Tooltip("The margin within which particles will react to the boundary. If left empty, will search for the 'BlackSpace' tagged collider at Awake().")]
-	public float boundaryCollisionMargin = 0.2f;
+	[Tooltip("The margin within which particles will react to the boundary. Increase this to prevent leaking.")]
+	public float boundaryCollisionMargin = 0.5f; // INCREASED from 0.2f
 	public bool invertBoundary = true;
 	[Tooltip("Stronger collision response to prevent leaking")]
-	public float collisionResponseStrength = 1.5f;
+	public float collisionResponseStrength = 2.5f; // INCREASED from 1.5f
+	[Tooltip("Additional penetration correction factor")]
+	public float penetrationCorrectionFactor = 1.5f; // NEW
+	[Tooltip("Maximum allowed penetration before emergency correction")]
+	public float maxPenetration = 0.3f;
+
+	[Header("Particle Spawn Filtering")]
+	[Tooltip("Enable boundary-based particle filtering at spawn")]
+	public bool enableSpawnFiltering = true;
+	[Tooltip("Minimum particles required - if filtering results in fewer, skip filtering")]
+	public int minRequiredParticles = 50;
+	[Tooltip("Distance particles must be from boundary edge")]
+	public float minSpawnDistanceFromBoundary = 0.2f; // Less aggressive than boundaryCollisionMargin
 
 	[Header("Player Interaction Settings")]
 	[Tooltip("Reference to the player for fluid interaction")]
@@ -68,7 +80,6 @@ public class FluidSim2D : MonoBehaviour
 	[Tooltip("Reduction factor for buoyancy near edges")]
 	[Range(0f, 1f)] public float edgeBuoyancyReduction = 0.6f;
 
-	// Add these private fields to your existing private fields section
 	private float smoothedSubmersionDepth;
 	private float lastSubmersionDepth;
 	private int framesSinceLastBuoyancyUpdate;
@@ -105,6 +116,9 @@ public class FluidSim2D : MonoBehaviour
 	[Header("References")]
 	public ComputeShader compute;
 	public Spawner2D spawner2D;
+
+	[Header("Debug")]
+	public bool enableDebugLogs = true;
 
 	// New ComputeBuffers for Polygon Boundary
 	ComputeBuffer _boundaryPointsBuffer;
@@ -147,6 +161,7 @@ public class FluidSim2D : MonoBehaviour
 	bool isPaused;
 	Spawner2D.ParticleSpawnData spawnData;
 	bool pauseNextFrame;
+	bool isInitialized = false;
 
 	public int numParticles { get; private set; }
 
@@ -161,20 +176,30 @@ public class FluidSim2D : MonoBehaviour
 			LoadBoundaryPolygonPoints();
 			loadPolygonPoints = false;
 		}
+
+		// Validate settings
+		minRequiredParticles = Mathf.Max(1, minRequiredParticles);
+		minSpawnDistanceFromBoundary = Mathf.Max(0.01f, minSpawnDistanceFromBoundary);
 	}
 
 	void Awake()
 	{
+		// Validate required components first
+		if (!ValidateRequiredComponents())
+		{
+			enabled = false;
+			return;
+		}
+
 		// Auto-find player if not assigned
 		if (player == null)
 		{
 			player = FindFirstObjectByType<PlayerManager>();
-			if (player == null)
+			if (player == null && enableDebugLogs)
 			{
 				Debug.LogError("FluidSim2D: No PlayerManager found! Player interaction will not work.");
 			}
 		}
-
 
 		// if you forgot to hook it up in the Inspector, grab it now:
 		if (boundaryComposite == null)
@@ -185,10 +210,45 @@ public class FluidSim2D : MonoBehaviour
 		}
 	}
 
+	bool ValidateRequiredComponents()
+	{
+		bool isValid = true;
+		System.Text.StringBuilder errors = new System.Text.StringBuilder("FluidSim2D validation errors:\n");
+
+		if (compute == null)
+		{
+			errors.AppendLine("- Compute Shader is not assigned");
+			isValid = false;
+		}
+
+		if (spawner2D == null)
+		{
+			errors.AppendLine("- Spawner2D is not assigned");
+			isValid = false;
+		}
+
+		if (!isValid)
+		{
+			Debug.LogError(errors.ToString(), this);
+		}
+
+		return isValid;
+	}
+
 	void Start()
 	{
-		Debug.Log("Controls:LMB = Attract, RMB = Repel");
-		Init();
+		if (enableDebugLogs)
+		{
+			Debug.Log("Controls:LMB = Attract, RMB = Repel");
+		}
+
+		// Initialize the simulation
+		if (!Init())
+		{
+			Debug.LogError("FluidSim2D: Initialization failed! Disabling component.");
+			enabled = false;
+			return;
+		}
 
 		// Get player rigidbody for velocity tracking
 		if (player != null)
@@ -196,73 +256,289 @@ public class FluidSim2D : MonoBehaviour
 			playerRigidbody = player.GetComponent<Rigidbody2D>();
 			previousPlayerPosition = player.transform.position;
 		}
+
+		isInitialized = true;
+		if (enableDebugLogs)
+		{
+			Debug.Log($"FluidSim2D: Successfully initialized with {numParticles} particles");
+		}
 	}
 
-	void Init()
+	bool Init()
 	{
-		float deltaTime = 1 / 60f;
-		Time.fixedDeltaTime = deltaTime;
-
-		spawnData = spawner2D.GetSpawnData();
-		numParticles = spawnData.positions.Length;
-		spatialHash = new SpatialHash(numParticles);
-
-		if (boundaryComposite != null)
+		try
 		{
-			var keep = new List<float2>();
-			var keepV = new List<float2>();
-			for (int i = 0; i < spawnData.positions.Length; i++)
+			float deltaTime = 1 / 60f;
+			Time.fixedDeltaTime = deltaTime;
+
+			// Get initial spawn data
+			if (spawner2D == null)
 			{
-				Vector2 candidate = spawnData.positions[i];
-				if (!boundaryComposite.OverlapPoint(candidate))
+				Debug.LogError("FluidSim2D: Spawner2D is null!");
+				return false;
+			}
+
+			spawnData = spawner2D.GetSpawnData();
+
+			if (spawnData.positions == null || spawnData.positions.Length == 0)
+			{
+				Debug.LogError("FluidSim2D: Spawner2D returned no particles! Check your spawner settings.");
+				return false;
+			}
+
+			int originalParticleCount = spawnData.positions.Length;
+			if (enableDebugLogs)
+			{
+				Debug.Log($"FluidSim2D: Spawner generated {originalParticleCount} particles");
+			}
+
+			// Apply boundary filtering if enabled
+			if (enableSpawnFiltering && boundaryComposite != null && useBoundary)
+			{
+				if (!FilterParticlesByBoundary(originalParticleCount))
 				{
-					keep.Add(candidate);
-					keepV.Add(spawnData.velocities[i]);
+					return false; // Filtering failed critically
+				}
+			}
+			else
+			{
+				numParticles = originalParticleCount;
+				if (enableDebugLogs)
+				{
+					Debug.Log("FluidSim2D: Boundary filtering disabled - using all spawned particles");
 				}
 			}
 
-			spawnData.positions = keep.ToArray();
-			spawnData.velocities = keepV.ToArray();
+			// Final validation
+			if (numParticles <= 0)
+			{
+				Debug.LogError("FluidSim2D: No particles remaining after filtering!");
+				return false;
+			}
+
+			// Initialize spatial hash
+			spatialHash = new SpatialHash(numParticles);
+
+			// Create compute buffers
+			if (!CreateComputeBuffers())
+			{
+				return false;
+			}
+
+			// Set initial data
+			SetInitialBufferData(spawnData);
+
+			// Initialize compute shader
+			if (!InitializeComputeShader())
+			{
+				return false;
+			}
+
+			// Initialize boundary system
+			if (useBoundary && boundaryComposite != null)
+			{
+				if (!InitializeBoundarySystem())
+				{
+					Debug.LogWarning("FluidSim2D: Boundary system initialization failed - continuing without boundaries");
+					useBoundary = false;
+				}
+			}
+
+			return true;
+		}
+		catch (System.Exception e)
+		{
+			Debug.LogError($"FluidSim2D: Exception during initialization: {e.Message}\n{e.StackTrace}");
+			return false;
+		}
+	}
+
+	bool FilterParticlesByBoundary(int originalCount)
+	{
+		var validParticles = new List<float2>();
+		var validVelocities = new List<float2>();
+		int filteredCount = 0;
+
+		if (enableDebugLogs)
+		{
+			Debug.Log($"FluidSim2D: Starting boundary filtering. InvertBoundary: {invertBoundary}");
 		}
 
-		// Create buffers
-		positionBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
-		predictedPositionBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
-		velocityBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
-		densityBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+		for (int i = 0; i < spawnData.positions.Length; i++)
+		{
+			Vector2 candidate = spawnData.positions[i];
 
-		sortTarget_Position = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
-		sortTarget_PredicitedPosition = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
-		sortTarget_Velocity = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			try
+			{
+				bool isInside = boundaryComposite.OverlapPoint(candidate);
 
-		SetInitialBufferData(spawnData);
+				// For inverted boundary, we want particles inside
+				// For normal boundary, we want particles outside  
+				bool shouldKeep = invertBoundary ? isInside : !isInside;
 
-		// Init compute
-		ComputeHelper.SetBuffer(compute, positionBuffer, "Positions", externalForcesKernel, updatePositionKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
-		ComputeHelper.SetBuffer(compute, predictedPositionBuffer, "PredictedPositions", externalForcesKernel, spatialHashKernel, densityKernel, pressureKernel, viscosityKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
-		ComputeHelper.SetBuffer(compute, velocityBuffer, "Velocities", externalForcesKernel, pressureKernel, viscosityKernel, updatePositionKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
-		ComputeHelper.SetBuffer(compute, densityBuffer, "Densities", densityKernel, pressureKernel, viscosityKernel);
+				if (shouldKeep)
+				{
+					// Less aggressive distance check - only filter if very close to boundary
+					float distToBoundary = GetDistanceToNearestBoundary(candidate);
 
-		ComputeHelper.SetBuffer(compute, spatialHash.SpatialIndices, "SortedIndices", spatialHashKernel, reorderKernel);
-		ComputeHelper.SetBuffer(compute, spatialHash.SpatialOffsets, "SpatialOffsets", spatialHashKernel, densityKernel, pressureKernel, viscosityKernel);
-		ComputeHelper.SetBuffer(compute, spatialHash.SpatialKeys, "SpatialKeys", spatialHashKernel, densityKernel, pressureKernel, viscosityKernel);
+					// Use the less aggressive minimum spawn distance
+					if (distToBoundary > minSpawnDistanceFromBoundary)
+					{
+						validParticles.Add(candidate);
+						validVelocities.Add(spawnData.velocities[i]);
+					}
+					else
+					{
+						filteredCount++;
+					}
+				}
+				else
+				{
+					filteredCount++;
+				}
+			}
+			catch (System.Exception e)
+			{
+				// If boundary checking fails for a particle, include it anyway
+				Debug.LogWarning($"FluidSim2D: Boundary check failed for particle {i}: {e.Message}");
+				validParticles.Add(candidate);
+				validVelocities.Add(spawnData.velocities[i]);
+			}
+		}
 
-		ComputeHelper.SetBuffer(compute, sortTarget_Position, "SortTarget_Positions", reorderKernel, copybackKernel);
-		ComputeHelper.SetBuffer(compute, sortTarget_PredicitedPosition, "SortTarget_PredictedPositions", reorderKernel, copybackKernel);
-		ComputeHelper.SetBuffer(compute, sortTarget_Velocity, "SortTarget_Velocities", reorderKernel, copybackKernel);
+		int validCount = validParticles.Count;
 
-		compute.SetInt("numParticles", numParticles);
+		// Check if we have enough particles after filtering
+		if (validCount < minRequiredParticles)
+		{
+			Debug.LogWarning($"FluidSim2D: Boundary filtering left only {validCount} particles (min required: {minRequiredParticles}). " +
+							"Disabling spawn filtering and using all particles.");
 
-		// Initialize polygon boundary buffers
-		if (useBoundary && boundaryComposite != null)
+			// Use original data instead of filtered data
+			numParticles = originalCount;
+			return true;
+		}
+
+		// Apply filtered results
+		spawnData.positions = validParticles.ToArray();
+		spawnData.velocities = validVelocities.ToArray();
+		numParticles = validCount;
+
+		if (enableDebugLogs)
+		{
+			Debug.Log($"FluidSim2D: Boundary filtering complete. Kept: {validCount}, Filtered: {filteredCount}, Success rate: {(validCount / (float)originalCount) * 100:F1}%");
+		}
+
+		return true;
+	}
+
+	bool CreateComputeBuffers()
+	{
+		try
+		{
+			// Validate particle count before creating buffers
+			if (numParticles <= 0)
+			{
+				Debug.LogError($"FluidSim2D: Cannot create buffers with {numParticles} particles!");
+				return false;
+			}
+
+			if (enableDebugLogs)
+			{
+				Debug.Log($"FluidSim2D: Creating compute buffers for {numParticles} particles");
+			}
+
+			// Create main buffers
+			positionBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			predictedPositionBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			velocityBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			densityBuffer = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+
+			// Create sorting buffers
+			sortTarget_Position = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			sortTarget_PredicitedPosition = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+			sortTarget_Velocity = ComputeHelper.CreateStructuredBuffer<float2>(numParticles);
+
+			// Validate buffers were created successfully
+			if (positionBuffer == null || velocityBuffer == null || densityBuffer == null)
+			{
+				Debug.LogError("FluidSim2D: Failed to create compute buffers!");
+				return false;
+			}
+
+			return true;
+		}
+		catch (System.Exception e)
+		{
+			Debug.LogError($"FluidSim2D: Exception creating compute buffers: {e.Message}");
+			return false;
+		}
+	}
+
+	bool InitializeComputeShader()
+	{
+		try
+		{
+			if (compute == null)
+			{
+				Debug.LogError("FluidSim2D: Compute shader is null!");
+				return false;
+			}
+
+			// Set buffers on compute shader
+			ComputeHelper.SetBuffer(compute, positionBuffer, "Positions", externalForcesKernel, updatePositionKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
+			ComputeHelper.SetBuffer(compute, predictedPositionBuffer, "PredictedPositions", externalForcesKernel, spatialHashKernel, densityKernel, pressureKernel, viscosityKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
+			ComputeHelper.SetBuffer(compute, velocityBuffer, "Velocities", externalForcesKernel, pressureKernel, viscosityKernel, updatePositionKernel, reorderKernel, copybackKernel, polygonCollisionKernel);
+			ComputeHelper.SetBuffer(compute, densityBuffer, "Densities", densityKernel, pressureKernel, viscosityKernel);
+
+			// Set spatial hash buffers
+			ComputeHelper.SetBuffer(compute, spatialHash.SpatialIndices, "SortedIndices", spatialHashKernel, reorderKernel);
+			ComputeHelper.SetBuffer(compute, spatialHash.SpatialOffsets, "SpatialOffsets", spatialHashKernel, densityKernel, pressureKernel, viscosityKernel);
+			ComputeHelper.SetBuffer(compute, spatialHash.SpatialKeys, "SpatialKeys", spatialHashKernel, densityKernel, pressureKernel, viscosityKernel);
+
+			// Set sorting target buffers
+			ComputeHelper.SetBuffer(compute, sortTarget_Position, "SortTarget_Positions", reorderKernel, copybackKernel);
+			ComputeHelper.SetBuffer(compute, sortTarget_PredicitedPosition, "SortTarget_PredictedPositions", reorderKernel, copybackKernel);
+			ComputeHelper.SetBuffer(compute, sortTarget_Velocity, "SortTarget_Velocities", reorderKernel, copybackKernel);
+
+			// Set particle count
+			compute.SetInt("numParticles", numParticles);
+
+			return true;
+		}
+		catch (System.Exception e)
+		{
+			Debug.LogError($"FluidSim2D: Exception initializing compute shader: {e.Message}");
+			return false;
+		}
+	}
+
+	bool InitializeBoundarySystem()
+	{
+		try
 		{
 			LoadBoundaryPolygonPoints();
+
+			if (_boundaryPointsBuffer == null || _numBoundaryPoints < 3)
+			{
+				Debug.LogError("FluidSim2D: Failed to create boundary points buffer");
+				return false;
+			}
 
 			ComputeHelper.SetBuffer(compute, _boundaryPointsBuffer, "_BoundaryPoints", polygonCollisionKernel);
 			compute.SetInt("_NumBoundaryPoints", _numBoundaryPoints);
 			compute.SetFloat("_BoundaryCollisionMargin", boundaryCollisionMargin);
 			compute.SetBool("_InvertBoundary", invertBoundary);
 			compute.SetFloat("_CollisionResponseStrength", collisionResponseStrength);
+			compute.SetFloat("_PenetrationCorrectionFactor", penetrationCorrectionFactor);
+			compute.SetFloat("_MaxPenetration", maxPenetration);
+
+			return true;
+		}
+		catch (System.Exception e)
+		{
+			Debug.LogError($"FluidSim2D: Exception initializing boundary system: {e.Message}");
+			return false;
 		}
 	}
 
@@ -270,13 +546,18 @@ public class FluidSim2D : MonoBehaviour
 	{
 		List<float2> worldPoints = new List<float2>();
 
-		// 1) If you’ve got a CompositeCollider2D, iterate all its paths…
 		if (boundaryComposite != null)
 		{
 			for (int p = 0; p < boundaryComposite.pathCount; ++p)
 			{
 				var pts = new Vector2[boundaryComposite.GetPathPointCount(p)];
 				boundaryComposite.GetPath(p, pts);
+
+				// Ensure points are in correct winding order for ray-casting
+				if (!IsCounterClockwise(pts))
+				{
+					System.Array.Reverse(pts);
+				}
 
 				// Transform each into world‐space
 				foreach (var lp in pts)
@@ -288,26 +569,79 @@ public class FluidSim2D : MonoBehaviour
 		}
 		else
 		{
-			Debug.LogWarning("FluidSim2D: no boundaryComposite or boundaryComposite assigned");
+			Debug.LogWarning("FluidSim2D: no boundaryComposite assigned");
 			return;
 		}
 
-		// 2) Upload to GPU
+		// Validate we have enough points
+		if (worldPoints.Count < 3)
+		{
+			Debug.LogError("FluidSim2D: Not enough boundary points to form a valid polygon");
+			return;
+		}
+
+		// Upload to GPU
 		_numBoundaryPoints = worldPoints.Count;
 		ComputeHelper.CreateStructuredBuffer<float2>(ref _boundaryPointsBuffer, _numBoundaryPoints);
 		_boundaryPointsBuffer.SetData(worldPoints.ToArray());
 
-		ComputeHelper.SetBuffer(compute, _boundaryPointsBuffer, "_BoundaryPoints", polygonCollisionKernel);
-		compute.SetInt("_NumBoundaryPoints", _numBoundaryPoints);
-		compute.SetFloat("_BoundaryCollisionMargin", boundaryCollisionMargin);
-		compute.SetBool("_InvertBoundary", invertBoundary);
-		compute.SetFloat("_CollisionResponseStrength", collisionResponseStrength);
+		if (enableDebugLogs)
+		{
+			Debug.Log($"FluidSim2D: Loaded {_numBoundaryPoints} boundary points from composite collider");
+		}
+	}
 
-		Debug.Log($"Loaded {_numBoundaryPoints} boundary points from composite collider");
+	private bool IsCounterClockwise(Vector2[] points)
+	{
+		float signedArea = 0f;
+		for (int i = 0; i < points.Length; i++)
+		{
+			int next = (i + 1) % points.Length;
+			signedArea += (points[next].x - points[i].x) * (points[next].y + points[i].y);
+		}
+		return signedArea < 0f;
+	}
+
+	private float GetDistanceToNearestBoundary(Vector2 point)
+	{
+		if (boundaryComposite == null) return float.MaxValue;
+
+		float minDistance = float.MaxValue;
+
+		try
+		{
+			for (int p = 0; p < boundaryComposite.pathCount; ++p)
+			{
+				var pts = new Vector2[boundaryComposite.GetPathPointCount(p)];
+				boundaryComposite.GetPath(p, pts);
+
+				for (int i = 0; i < pts.Length; i++)
+				{
+					Vector3 wp1 = boundaryComposite.transform.TransformPoint(pts[i]);
+					Vector3 wp2 = boundaryComposite.transform.TransformPoint(pts[(i + 1) % pts.Length]);
+
+					float dist = DistanceToLineSegment(point, wp1, wp2);
+					minDistance = Mathf.Min(minDistance, dist);
+				}
+			}
+		}
+		catch (System.Exception e)
+		{
+			Debug.LogWarning($"FluidSim2D: Error calculating distance to boundary: {e.Message}");
+			return float.MaxValue;
+		}
+
+		return minDistance;
 	}
 
 	void Update()
 	{
+		// Don't update if not properly initialized
+		if (!isInitialized || numParticles <= 0)
+		{
+			return;
+		}
+
 		// Update player tracking
 		UpdatePlayerTracking();
 
@@ -321,12 +655,17 @@ public class FluidSim2D : MonoBehaviour
 
 	void FixedUpdate()
 	{
+		// Don't update if not properly initialized
+		if (!isInitialized) return;
+
 		// Apply fluid forces to player
 		if (player != null && playerRigidbody != null)
 		{
 			ApplyFluidForcesToPlayer();
 		}
 	}
+
+	// ... [All the existing player tracking and fluid methods remain the same] ...
 
 	void UpdatePlayerTracking()
 	{
@@ -337,7 +676,7 @@ public class FluidSim2D : MonoBehaviour
 		// Calculate player velocity
 		if (playerRigidbody != null)
 		{
-			playerVelocity = playerRigidbody.linearVelocity;
+			playerVelocity = playerRigidbody.velocity;
 		}
 		else
 		{
@@ -381,22 +720,7 @@ public class FluidSim2D : MonoBehaviour
 				}
 				else
 				{
-					float minDistToBoundary = float.MaxValue;
-					int pathCount = boundaryComposite.pathCount;
-					for (int p = 0; p < pathCount; ++p)
-					{
-						int count = boundaryComposite.GetPathPointCount(p);
-						Vector2[] pts = new Vector2[count];
-						boundaryComposite.GetPath(p, pts);
-
-						for (int i = 0; i < count; ++i)
-						{
-							Vector3 w1 = boundaryComposite.transform.TransformPoint(pts[i]);
-							Vector3 w2 = boundaryComposite.transform.TransformPoint(pts[(i + 1) % count]);
-							float dist = DistanceToLineSegment(playerPos, w1, w2);
-							minDistToBoundary = Mathf.Min(minDistToBoundary, dist);
-						}
-					}
+					float minDistToBoundary = GetDistanceToNearestBoundary(playerPos);
 					rawSubmersion = Mathf.Clamp(minDistToBoundary, 0f, maxBuoyancyDepth);
 				}
 			}
@@ -461,7 +785,6 @@ public class FluidSim2D : MonoBehaviour
 		return false;
 	}
 
-	// ==== NEW: Method to cache particle positions from GPU ====
 	void UpdateCachedParticlePositions()
 	{
 		if (positionBuffer == null || numParticles == 0) return;
@@ -507,11 +830,6 @@ public class FluidSim2D : MonoBehaviour
 
 		// Count particles in different directions around the player
 		int[] directionCounts = new int[8]; // 8 directions around player
-		Vector2[] directions = {
-		Vector2.up, Vector2.down, Vector2.left, Vector2.right,
-		new Vector2(1, 1).normalized, new Vector2(-1, 1).normalized,
-		new Vector2(1, -1).normalized, new Vector2(-1, -1).normalized
-	};
 
 		foreach (Vector2 particlePos in cachedParticlePositions)
 		{
@@ -622,15 +940,6 @@ public class FluidSim2D : MonoBehaviour
 			Vector2 turbulenceForce = Vector2.right * turbulence * depthRatio * 0.5f;
 			playerRigidbody.AddForce(turbulenceForce, ForceMode2D.Force);
 		}
-
-		// Debug info (reduced frequency)
-		framesSinceLastBuoyancyUpdate++;
-		if (framesSinceLastBuoyancyUpdate >= 120) // Every 2 seconds at 60fps
-		{
-			Debug.Log($"Buoyancy - Depth: {currentSubmersionDepth:F2}, Smoothed: {smoothedSubmersionDepth:F2}, " +
-					 $"Force: {currentBuoyancyForce:F2}, Edge: {isNearFluidEdge}, Particles: {GetNearbyParticleCount()}");
-			framesSinceLastBuoyancyUpdate = 0;
-		}
 	}
 
 	void RunSimulationFrame(float frameTime)
@@ -650,8 +959,8 @@ public class FluidSim2D : MonoBehaviour
 		// External forces and prediction (includes player interaction)
 		ComputeHelper.Dispatch(compute, numParticles, kernelIndex: externalForcesKernel);
 
-		// Apply polygon collision to predicted positions BEFORE spatial operations
-		if (useBoundary)
+		// FIRST: Apply polygon collision to predicted positions to prevent escaping
+		if (useBoundary && _boundaryPointsBuffer != null)
 		{
 			ComputeHelper.Dispatch(compute, numParticles, kernelIndex: polygonCollisionKernel);
 		}
@@ -664,8 +973,20 @@ public class FluidSim2D : MonoBehaviour
 		ComputeHelper.Dispatch(compute, numParticles, kernelIndex: pressureKernel);
 		ComputeHelper.Dispatch(compute, numParticles, kernelIndex: viscosityKernel);
 
+		// SECOND: Apply polygon collision again before position update
+		if (useBoundary && _boundaryPointsBuffer != null)
+		{
+			ComputeHelper.Dispatch(compute, numParticles, kernelIndex: polygonCollisionKernel);
+		}
+
 		// Update positions
 		ComputeHelper.Dispatch(compute, numParticles, kernelIndex: updatePositionKernel);
+
+		// THIRD: Final boundary enforcement after position update
+		if (useBoundary && _boundaryPointsBuffer != null)
+		{
+			ComputeHelper.Dispatch(compute, numParticles, kernelIndex: polygonCollisionKernel);
+		}
 	}
 
 	void RunSpatial()
@@ -714,11 +1035,13 @@ public class FluidSim2D : MonoBehaviour
 		// Player interaction settings (existing)
 		UpdatePlayerInteractionSettings();
 
-		// Update boundary settings if they've changed
-		if (useBoundary)
+		// Update boundary settings EVERY frame to ensure they stay consistent
+		if (useBoundary && _boundaryPointsBuffer != null)
 		{
 			compute.SetFloat("_BoundaryCollisionMargin", boundaryCollisionMargin);
 			compute.SetFloat("_CollisionResponseStrength", collisionResponseStrength);
+			compute.SetFloat("_PenetrationCorrectionFactor", penetrationCorrectionFactor);
+			compute.SetFloat("_MaxPenetration", maxPenetration);
 		}
 	}
 
@@ -752,13 +1075,6 @@ public class FluidSim2D : MonoBehaviour
 			{
 				playerFluidControlEffect.transform.position = controlPos;
 				playerFluidControlEffect.Play();
-			}
-
-			// Debug output (reduced frequency)
-			if (Time.frameCount % 60 == 0) // Every second
-			{
-				string action = controlStrength > 0 ? "Pulling" : "Pushing";
-				Debug.Log($"Player Fluid Control - {action} with strength {Mathf.Abs(controlStrength):F2} at radius {controlRadius:F2}");
 			}
 		}
 		else
@@ -828,12 +1144,6 @@ public class FluidSim2D : MonoBehaviour
 		compute.SetVector("playerVelocity", playerVelocity);
 		compute.SetFloat("velocityTransferStrength", velocityTransferStrength);
 		compute.SetBool("isPlayerInMirroredState", isInMirroredState);
-
-		// Debug output
-		if (Time.frameCount % 60 == 0) // Every second at 60fps
-		{
-			Debug.Log($"Player Fluid Interaction - Strength: {finalStrength:F2}, Near Fluid: {isNearFluid}, State: {(isInMirroredState ? "Mirrored" : "Normal")}");
-		}
 	}
 
 	void SetInitialBufferData(Spawner2D.ParticleSpawnData spawnData)
@@ -846,80 +1156,61 @@ public class FluidSim2D : MonoBehaviour
 	void OnDestroy()
 	{
 		ComputeHelper.Release(positionBuffer, predictedPositionBuffer, velocityBuffer, densityBuffer, sortTarget_Position, sortTarget_Velocity, sortTarget_PredicitedPosition);
-		spatialHash.Release();
+		spatialHash?.Release();
 		ComputeHelper.Release(_boundaryPointsBuffer);
 	}
 
 	void OnDrawGizmos()
 	{
+		// Draw debug info only when playing
+		if (!Application.isPlaying || !isInitialized) return;
+
 		// Draw mouse interaction
-		if (Application.isPlaying)
+		Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+		bool isPullInteraction = Input.GetMouseButton(0);
+		bool isPushInteraction = Input.GetMouseButton(1);
+		bool isInteracting = isPullInteraction || isPushInteraction;
+
+		if (isInteracting)
 		{
-			Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-			bool isPullInteraction = Input.GetMouseButton(0);
-			bool isPushInteraction = Input.GetMouseButton(1);
-			bool isInteracting = isPullInteraction || isPushInteraction;
+			Gizmos.color = isPullInteraction ? Color.green : Color.red;
+			Gizmos.DrawWireSphere(mousePos, interactionRadius);
+		}
 
-			if (isInteracting)
-			{
-				Gizmos.color = isPullInteraction ? Color.green : Color.red;
-				Gizmos.DrawWireSphere(mousePos, interactionRadius);
-			}
+		// Draw player fluid control interaction
+		if (enablePlayerFluidControl && player != null && player.IsPlayerControllingFluid())
+		{
+			Vector2 playerControlPos = player.GetPlayerFluidControlPosition();
+			float controlStrength = player.GetPlayerFluidControlStrength();
+			float controlRadius = player.GetPlayerFluidControlRadius();
 
-			// Draw player fluid control interaction
-			if (enablePlayerFluidControl && player != null && player.IsPlayerControllingFluid())
-			{
-				Vector2 playerControlPos = player.GetPlayerFluidControlPosition();
-				float controlStrength = player.GetPlayerFluidControlStrength();
-				float controlRadius = player.GetPlayerFluidControlRadius();
+			// Different colors for pull vs push
+			Gizmos.color = controlStrength > 0 ?
+				new Color(0f, 1f, 0.5f, 0.7f) :  // Green-cyan for pull
+				new Color(1f, 0.5f, 0f, 0.7f);   // Orange-red for push
 
-				// Different colors for pull vs push
-				Gizmos.color = controlStrength > 0 ?
-					new Color(0f, 1f, 0.5f, 0.7f) :  // Green-cyan for pull
-					new Color(1f, 0.5f, 0f, 0.7f);   // Orange-red for push
+			// Draw main interaction sphere
+			Gizmos.DrawWireSphere(playerControlPos, controlRadius);
 
-				// Draw main interaction sphere
-				Gizmos.DrawWireSphere(playerControlPos, controlRadius);
+			// Draw directional arrows to show pull/push
+			Gizmos.color = controlStrength > 0 ? Color.cyan : Color.red;
+			Vector3 arrowDirection = controlStrength > 0 ? Vector3.up : Vector3.down;
+			Vector3 arrowStart = playerControlPos + Vector2.up * 0.5f;
+			Vector3 arrowEnd = arrowStart + arrowDirection * 0.3f;
+			Gizmos.DrawLine(arrowStart, arrowEnd);
+		}
 
-				// Draw strength indicator with inner sphere
-				float strengthRatio = Mathf.Abs(controlStrength) / player.GetCurrentPlayerInteractionStrength();
-				Gizmos.color = new Color(Gizmos.color.r, Gizmos.color.g, Gizmos.color.b, 0.3f);
-				Gizmos.DrawSphere(playerControlPos, controlRadius * strengthRatio * 0.5f);
-
-				// Draw directional arrows to show pull/push
-				Gizmos.color = controlStrength > 0 ? Color.cyan : Color.red;
-				Vector3 arrowDirection = controlStrength > 0 ? Vector3.up : Vector3.down;
-				Vector3 arrowStart = playerControlPos + Vector2.up * 0.5f;
-				Vector3 arrowEnd = arrowStart + arrowDirection * 0.3f;
-				Gizmos.DrawLine(arrowStart, arrowEnd);
-
-				// Arrow head
-				Vector3 arrowHead1 = arrowEnd + (Vector3.left + -arrowDirection).normalized * 0.1f;
-				Vector3 arrowHead2 = arrowEnd + (Vector3.right + -arrowDirection).normalized * 0.1f;
-				Gizmos.DrawLine(arrowEnd, arrowHead1);
-				Gizmos.DrawLine(arrowEnd, arrowHead2);
-			}
+		// Draw boundary collision margin for debugging
+		if (useBoundary && boundaryComposite != null)
+		{
+			Gizmos.color = new Color(1f, 1f, 0f, 0.3f);
+			Vector3 center = boundaryComposite.bounds.center;
+			Vector3 size = boundaryComposite.bounds.size + Vector3.one * boundaryCollisionMargin * 2f;
+			Gizmos.DrawWireCube(center, size);
 		}
 	}
 
-	private float GetCurrentPlayerInteractionStrength()
-	{
-		if (player == null) return 0f;
-
-		bool isInMirroredState = player.IsInMirroredState();
-		float baseStrength = isInMirroredState ? mirroredInteractionStrength : playerDisplacementStrength;
-		float movementFactor = playerVelocity.magnitude > 0.1f ? movementMultiplier : 1f;
-		float finalStrength = baseStrength * movementFactor;
-
-		if (isInMirroredState)
-		{
-			finalStrength *= playerVelocity.magnitude > 1f ? -1f : 1f;
-		}
-
-		return finalStrength;
-	}
-
-	// method to check if player is actually inside the polygon
+	// Helper methods
 	private bool IsPlayerInsidePolygon()
 	{
 		// Fallback to particle-based detection if polygon not available
@@ -1018,13 +1309,15 @@ public class FluidSim2D : MonoBehaviour
 		int count = 0;
 		float radiusSqr = fluidDetectionRadius * fluidDetectionRadius;
 
-		for (int i = 0; i < cachedParticlePositions.Length; i++)
+		if (cachedParticlePositions != null)
 		{
-			if ((playerPos - cachedParticlePositions[i]).sqrMagnitude <= radiusSqr)
-				count++;
+			for (int i = 0; i < cachedParticlePositions.Length; i++)
+			{
+				if ((playerPos - cachedParticlePositions[i]).sqrMagnitude <= radiusSqr)
+					count++;
+			}
 		}
 
 		return count;
 	}
-
 }

@@ -206,7 +206,8 @@ public class SplineShapeGenerator_BlackSpace : MonoBehaviour
 
             // Add a polygon collider to the spline object
             PolygonCollider2D polyCollider = container.gameObject.AddComponent<PolygonCollider2D>();
-            polyCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+            // polyCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+            polyCollider.usedByComposite = true;
             polyCollider.SetPath(0, points);
 
             // Create a mesh from the collider path

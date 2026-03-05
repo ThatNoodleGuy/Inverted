@@ -74,23 +74,34 @@ public class CombinedColliderGenerator : MonoBehaviour
                 if (usePolygonCollider)
                 {
                     PolygonCollider2D polyCollider = child.gameObject.AddComponent<PolygonCollider2D>();
-                    polyCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+                    // polyCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+                    polyCollider.usedByComposite = true;
                 }
                 else
                 {
                     BoxCollider2D boxCollider = child.gameObject.AddComponent<BoxCollider2D>();
-                    boxCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+                    // boxCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
+                    boxCollider.usedByComposite = true;
                 }
             }
             else if (existingCollider != null)
             {
                 // Make sure existing collider is set for composite use
                 if (existingCollider is PolygonCollider2D)
-                    ((PolygonCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                {
+                    // ((PolygonCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                    ((PolygonCollider2D)existingCollider).usedByComposite = true;
+                }
                 else if (existingCollider is BoxCollider2D)
-                    ((BoxCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                {
+                    // ((BoxCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                    ((BoxCollider2D)existingCollider).usedByComposite = true;
+                }
                 else if (existingCollider is EdgeCollider2D)
-                    ((EdgeCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                {
+                    // ((EdgeCollider2D)existingCollider).compositeOperation = Collider2D.CompositeOperation.Merge;
+                    ((EdgeCollider2D)existingCollider).usedByComposite = true;
+                }
             }
         }
     }

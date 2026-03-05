@@ -112,12 +112,14 @@ const float pressureMultiplier;
 const float nearPressureMultiplier;
 const float viscosityStrength;
 
-// Polygon Boundary Settings
+// Polygon Boundary Settings (IMPROVED)
 StructuredBuffer<float2> _BoundaryPoints;
 const uint _NumBoundaryPoints;
 const float _BoundaryCollisionMargin;
 const bool _InvertBoundary;
 const float _CollisionResponseStrength;
+const float _PenetrationCorrectionFactor;  // NEW
+const float _MaxPenetration;               // NEW
 
 // Mouse interaction settings
 const float2 interactionInputPoint;
@@ -298,7 +300,7 @@ float2 ExternalForces(float2 pos, float2 velocity)
     return totalAccel;
 }
 
-// Helper function to determine if a point is inside a polygon
+// IMPROVED: Much more robust polygon collision detection and response
 bool IsPointInsidePolygon(float2 testPos)
 {
     if (_NumBoundaryPoints < 3) return false;
@@ -323,79 +325,176 @@ bool IsPointInsidePolygon(float2 testPos)
     return inside;
 }
 
-// Improved Polygon Collision Kernel
+// NEW: Calculate distance from point to polygon edge
+float DistanceToPolygonEdge(float2 testPos, out float2 closestNormal)
+{
+    float minSqDist = 1e20;
+    closestNormal = float2(0, 1);
+    
+    for (uint b = 0; b < _NumBoundaryPoints; ++b)
+    {
+        float2 p1 = _BoundaryPoints[b];
+        float2 p2 = _BoundaryPoints[(b + 1) % _NumBoundaryPoints];
+        float2 seg = p2 - p1;
+        float segLenSq = dot(seg, seg);
+        
+        if (segLenSq < 1e-6) continue;
+        
+        // Project point onto line segment
+        float t = saturate(dot(testPos - p1, seg) / segLenSq);
+        float2 proj = p1 + seg * t;
+        
+        float2 diff = testPos - proj;
+        float dsq = dot(diff, diff);
+        
+        if (dsq < minSqDist)
+        {
+            minSqDist = dsq;
+            closestNormal = (dsq > 1e-6) ? normalize(diff) : closestNormal;
+        }
+    }
+    
+    return sqrt(minSqDist);
+}
+
+// VASTLY IMPROVED: Polygon collision kernel with much better boundary enforcement
 [numthreads(NumThreads, 1, 1)]
 void PolygonCollision(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= numParticles || _NumBoundaryPoints < 2) return;
+    if (i >= numParticles || _NumBoundaryPoints < 3) return;
 
-    // 1) Load current pos + vel
     float2 pos = PredictedPositions[i];
     float2 vel = Velocities[i];
+    bool modified = false;
 
-    // 2) Find closest point on boundary and its (outward) normal
-    float  minSqDist    = 1e20;
-    float2 bestNormal   = float2(0,1);
+    // Step 1: Calculate distance to boundary and normal
+    float2 closestNormal;
+    float distToBoundary = DistanceToPolygonEdge(pos, closestNormal);
+    bool isInside = IsPointInsidePolygon(pos);
 
-    for (uint b = 0; b < _NumBoundaryPoints; ++b)
+    // Step 2: Determine if collision response is needed
+    bool needsCorrection = false;
+    float correctionDistance = 0;
+    
+    if (_InvertBoundary)
     {
-        // segment [p1,p2]
-        float2 p1 = _BoundaryPoints[b];
-        float2 p2 = _BoundaryPoints[(b+1) % _NumBoundaryPoints];
-        float2 seg = p2 - p1;
-        float  segLenSq = dot(seg,seg);
-        if (segLenSq < 1e-6) continue;
-
-        // project pos onto segment
-        float t = saturate(dot(pos - p1, seg) / segLenSq);
-        float2 proj = p1 + seg * t;
-
-        float2 diff = pos - proj;
-        float dsq  = dot(diff, diff);
-
-        if (dsq < minSqDist)
+        // For inverted boundaries, particles should stay inside
+        if (!isInside)
         {
-            minSqDist  = dsq;
-            // normal is from boundary→particle
-            bestNormal = (dsq > 1e-6) ? normalize(diff) : bestNormal;
+            needsCorrection = true;
+            correctionDistance = distToBoundary + _BoundaryCollisionMargin;
+            closestNormal = -closestNormal; // Flip normal to push inward
+        }
+        else if (distToBoundary < _BoundaryCollisionMargin)
+        {
+            needsCorrection = true;
+            correctionDistance = _BoundaryCollisionMargin - distToBoundary;
+            // closestNormal points outward from boundary, we want to push away from edge
+        }
+    }
+    else
+    {
+        // For normal boundaries, particles should stay outside
+        if (isInside)
+        {
+            needsCorrection = true;
+            correctionDistance = distToBoundary + _BoundaryCollisionMargin;
+            // closestNormal already points outward from boundary
+        }
+        else if (distToBoundary < _BoundaryCollisionMargin)
+        {
+            needsCorrection = true;
+            correctionDistance = _BoundaryCollisionMargin - distToBoundary;
+            // closestNormal points away from boundary
         }
     }
 
-    float  dist = sqrt(minSqDist);
-    bool   inside = IsPointInsidePolygon(pos);
-
-    // 3) Decide if we must collide (penetration)
-    bool shouldCollide;
-    if (_InvertBoundary)
-        shouldCollide = inside || (dist < _BoundaryCollisionMargin);
-    else
-        shouldCollide = !inside || (dist < _BoundaryCollisionMargin);
-
-    if (shouldCollide && dist < _BoundaryCollisionMargin)
+    // Step 3: Apply collision response if needed
+    if (needsCorrection)
     {
-        // if we flipped interior/exterior, invert normal
-        if (_InvertBoundary == inside)
-            bestNormal = -bestNormal;
-
-        // push out by the penetration amount
-        float pen = (_BoundaryCollisionMargin - dist) * _CollisionResponseStrength;
-        pos += bestNormal * pen;
-
-        // reflect & damp velocity
-        float vn = dot(vel, bestNormal);
-        if (vn < 0)
+        // Emergency correction for severe penetrations
+        float penetrationFactor = 1.0;
+        if (correctionDistance > _MaxPenetration)
         {
-            vel -= 2.0f * vn * bestNormal;
-            vel *= collisionDamping;
+            penetrationFactor = 2.0; // Double the correction for severe cases
+            correctionDistance = min(correctionDistance, _MaxPenetration * 1.5);
         }
+        
+        // Position correction with enhanced strength
+        float2 correction = closestNormal * correctionDistance * _CollisionResponseStrength * _PenetrationCorrectionFactor * penetrationFactor;
+        pos += correction;
+        
+        // Velocity reflection and damping
+        float velocityDotNormal = dot(vel, closestNormal);
+        
+        // Only reflect if moving toward the boundary
+        if (velocityDotNormal < 0)
+        {
+            // Reflect velocity
+            vel -= 2.0 * velocityDotNormal * closestNormal;
+            
+            // Apply damping
+            vel *= collisionDamping;
+            
+            // Add small outward push for stability
+            vel += closestNormal * abs(velocityDotNormal) * 0.1;
+        }
+        
+        // Additional stabilization: if still too close after correction, add emergency push
+        float newDist = DistanceToPolygonEdge(pos, closestNormal);
+        bool newIsInside = IsPointInsidePolygon(pos);
+        
+        bool stillNeedsCorrection = false;
+        if (_InvertBoundary)
+        {
+            stillNeedsCorrection = !newIsInside || newDist < _BoundaryCollisionMargin * 0.5;
+        }
+        else
+        {
+            stillNeedsCorrection = newIsInside || newDist < _BoundaryCollisionMargin * 0.5;
+        }
+        
+        if (stillNeedsCorrection)
+        {
+            // Emergency push with extra force
+            pos += closestNormal * _BoundaryCollisionMargin * 2.0 * _CollisionResponseStrength;
+            vel += closestNormal * 5.0; // Strong outward velocity
+        }
+        
+        modified = true;
+    }
 
-        Positions[i]  = pos;
+    // Step 4: Additional stability check - prevent particles from getting too close to corners
+    // This helps prevent leaking at sharp corners
+    if (modified || distToBoundary < _BoundaryCollisionMargin * 1.5)
+    {
+        // Check for nearby corners (simplified check)
+        float cornerThreshold = _BoundaryCollisionMargin * 0.8;
+        for (uint c = 0; c < _NumBoundaryPoints; c++)
+        {
+            float2 corner = _BoundaryPoints[c];
+            float2 toCorner = corner - pos;
+            float distToCorner = length(toCorner);
+            
+            if (distToCorner < cornerThreshold && distToCorner > 0.01)
+            {
+                float2 awayFromCorner = -normalize(toCorner);
+                pos += awayFromCorner * (cornerThreshold - distToCorner) * _CollisionResponseStrength;
+                vel += awayFromCorner * 2.0; // Push away from corner
+            }
+        }
+    }
+
+    // Update buffers if particle was modified
+    if (modified)
+    {
+        Positions[i] = pos;
         Velocities[i] = vel;
     }
 
-    // update predicted position for next step
-    PredictedPositions[i] = pos + vel * deltaTime;
+    // Always update predicted position for next step
+    PredictedPositions[i] = pos + vel * deltaTime * 0.8; // Slightly reduced prediction for stability
 }
 
 [numthreads(NumThreads, 1, 1)]

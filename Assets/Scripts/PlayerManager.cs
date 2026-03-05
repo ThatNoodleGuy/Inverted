@@ -530,8 +530,8 @@ public class PlayerManager : MonoBehaviour
             timeInFluid += Time.deltaTime;
 
             // Create splash effect when entering fluid or moving fast
-            if ((!wasInFluidPreviously && rb.linearVelocity.magnitude > splashThreshold) ||
-                (Time.time - lastSplashTime > 1f && rb.linearVelocity.magnitude > splashThreshold * 1.5f))
+            if ((!wasInFluidPreviously && rb.velocity.magnitude > splashThreshold) ||
+                (Time.time - lastSplashTime > 1f && rb.velocity.magnitude > splashThreshold * 1.5f))
             {
                 CreateSplashEffect();
                 lastSplashTime = Time.time;
@@ -583,11 +583,11 @@ public class PlayerManager : MonoBehaviour
     }
 
     // === Movement Property Getters ===
-    public Vector2 GetVelocity() => rb.linearVelocity;
+    public Vector2 GetVelocity() => rb.velocity;
 
     public float GetMovementIntensity()
     {
-        return Mathf.Clamp01(rb.linearVelocity.magnitude / (moveSpeed * 2f));
+        return Mathf.Clamp01(rb.velocity.magnitude / (moveSpeed * 2f));
     }
 
     public float GetCurrentMoveSpeed()
@@ -679,7 +679,7 @@ public class PlayerManager : MonoBehaviour
                 if (pm.isGrounded || (pm.isInFluid && pm.timeInFluid > 0.1f))
                 {
                     float jumpForce = pm.GetCurrentJumpForce();
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpForce);
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x, jumpForce);
 
                     if (pm.isInFluid)
                     {
@@ -698,7 +698,7 @@ public class PlayerManager : MonoBehaviour
         {
             input.x = Input.GetAxisRaw("Horizontal");
             float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
+            pm.rb.velocity = new Vector2(input.x * currentMoveSpeed, pm.rb.velocity.y);
 
             Vector2 normal = pm.DetectGroundNormal();
             if (pm.maintainUpright) pm.RotateToMatchNormal(normal);
@@ -721,7 +721,7 @@ public class PlayerManager : MonoBehaviour
                 if (objRb != null && objRb.bodyType == RigidbodyType2D.Dynamic)
                 {
                     objRb.AddForce(pushDirection * pm.pushForce, ForceMode2D.Force);
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x * 0.7f, pm.rb.linearVelocity.y);
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x * 0.7f, pm.rb.velocity.y);
                 }
             }
         }
@@ -738,7 +738,7 @@ public class PlayerManager : MonoBehaviour
         public void Enter()
         {
             pm.rb.gravityScale = -1f;
-            pm.rb.linearVelocity = Vector2.zero;
+            pm.rb.velocity = Vector2.zero;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.blackSpaceLayer, false);
 
             // Smooth transition to inverted
@@ -769,7 +769,7 @@ public class PlayerManager : MonoBehaviour
                 {
                     float jumpForce = pm.GetCurrentJumpForce();
                     Vector2 jumpDirection = pm.CanSwim() ? Vector2.up : Vector2.down;
-                    pm.rb.linearVelocity = new Vector2(pm.rb.linearVelocity.x, jumpDirection.y * jumpForce);
+                    pm.rb.velocity = new Vector2(pm.rb.velocity.x, jumpDirection.y * jumpForce);
 
                     if (pm.isInFluid)
                     {
@@ -786,7 +786,7 @@ public class PlayerManager : MonoBehaviour
         {
             input.x = Input.GetAxisRaw("Horizontal");
             float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.rb.linearVelocity = new Vector2(input.x * currentMoveSpeed, pm.rb.linearVelocity.y);
+            pm.rb.velocity = new Vector2(input.x * currentMoveSpeed, pm.rb.velocity.y);
 
             if (pm.CanSwim())
             {
@@ -987,7 +987,7 @@ public class PlayerManager : MonoBehaviour
             }
 
             // Reduce strength if player is moving fast to prevent overpowered effects
-            float movementFactor = Mathf.Clamp01(2f - (rb.linearVelocity.magnitude / moveSpeed));
+            float movementFactor = Mathf.Clamp01(2f - (rb.velocity.magnitude / moveSpeed));
             fluidControlStrength *= movementFactor;
         }
         else
