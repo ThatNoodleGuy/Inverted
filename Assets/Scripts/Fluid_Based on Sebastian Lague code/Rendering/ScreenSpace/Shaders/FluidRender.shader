@@ -31,6 +31,7 @@ Shader "Fluid/FluidRender"
             {
                 v2f o;
                 o.vertex = UnityObjectToClipPos(v.vertex);
+                // Keep fluid data in native RT space so it lines up with world positions
                 o.uv = v.uv;
                 return o;
             }
@@ -428,7 +429,7 @@ Shader "Fluid/FluidRender"
                 float thickness_hard = packedData.b;
                 float depth_hard = packedData.a;
 
-                float4 bg = tex2D(_MainTex, float2(i.uv.x, i.uv.y));
+                float4 bg = tex2D(_MainTex, float2(i.uv.x, 1.0 - i.uv.y));
                 float foam = bg.r;
                 float foamDepth = bg.b;
 

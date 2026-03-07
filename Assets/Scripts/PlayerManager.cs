@@ -6,16 +6,23 @@ using UnityEngine.InputSystem;
 /// <summary>
 /// Enhanced PlayerManager with automatic space-based state transitions
 /// </summary>
-[RequireComponent(typeof(Rigidbody2D), typeof(SpriteRenderer), typeof(CapsuleCollider2D))]
+[RequireComponent(typeof(Rigidbody2D), typeof(SpriteRenderer), typeof(Collider2D))]
 public class PlayerManager : MonoBehaviour
 {
     // === Serialized Fields ===
+
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 5f;
     [SerializeField] private float jumpForce = 8f;
     [SerializeField] private float flipCooldown = 0.5f;
     [SerializeField] private bool maintainUpright = true;
     [SerializeField] private float rotationSpeed = 10f;
+    [SerializeField] private float maxMoveSpeed = 6f;
+    [SerializeField] private float accel = 30f;
+    [SerializeField] private float decel = 40f;
+    [SerializeField] private float coyoteTime = 0.12f;
+    [SerializeField] private float jumpBufferTime = 0.12f;
+    [SerializeField] private float jumpCutMultiplier = 0.4f;
 
     [Header("Sprite")]
     [SerializeField] private Color normalColor = Color.white;
@@ -26,6 +33,7 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private Transform groundChecker;
     [SerializeField] private float detectionRadius = 2f;
     [SerializeField] private float edgeFollowDistance = 0.3f;
+    [SerializeField] private float groundCheckDistance = 0.3f;
 
     [Header("Space Detection")]
     [SerializeField] private float spaceCheckRadius = 0.3f;
@@ -48,27 +56,6 @@ public class PlayerManager : MonoBehaviour
     [SerializeField] private float pushForce = 2f;
     [SerializeField] private float pushCheckDistance = 0.5f;
 
-    [Header("Fluid Interaction")]
-    [SerializeField] private FluidSim2D fluidSim;
-    [SerializeField] private float fluidPushRadius = 1.5f;
-    [SerializeField] private bool enableFluidInteraction = true;
-    [SerializeField] private ParticleSystem splashEffect;
-    [SerializeField] private float splashThreshold = 3f;
-
-    [Header("Fluid Movement Modifiers")]
-    [SerializeField] private float fluidMoveSpeedMultiplier = 0.7f;
-    [SerializeField] private float fluidJumpMultiplier = 1.2f;
-    [SerializeField] private bool canSwimInMirroredState = true;
-
-    [Header("Player Fluid Control")]
-    [SerializeField] private bool enablePlayerFluidControl = true;
-    [SerializeField] private float playerFluidInteractionStrength = 10f;
-    [SerializeField] private float playerFluidInteractionRadius = 3f;
-    [SerializeField] private KeyCode fluidPullKey = KeyCode.Z;
-    [SerializeField] private KeyCode fluidPushKey = KeyCode.X;
-    [SerializeField] private bool requireFluidProximityForControl = true;
-    [SerializeField] private float fluidControlProximityRadius = 2f;
-
     // === Space Types ===
     public enum SpaceType
     {
@@ -80,36 +67,31 @@ public class PlayerManager : MonoBehaviour
     // === Runtime Components & State ===
     private Rigidbody2D rb;
     private SpriteRenderer sr;
-    private CapsuleCollider2D cc;
+    private Collider2D playerCollider;
     private IPlayerState currentState;
     private NormalState normalState;
     private MirroredState mirroredState;
+    private PlayerWaterInteraction water;
 
     // === Cached Values ===
     private int invertedSpaceLayer;
     private int solidLayerMask;
     private bool isGrounded;
+    public bool IsGrounded => isGrounded;
     private Vector2 currentNormal;
     private Vector2 entryPoint;
+
+    // === Movement Tracking ===
+    private float currentXSpeed;
+    private float lastGroundedTime;
+    private float lastJumpPressedTime;
     private float lastFlipTime;
     private Vector2 lastPosition;
-    private float lastSplashTime;
 
     // Space detection
     private SpaceType currentSpaceType;
     private SpaceType previousSpaceType;
     private bool isTransitioning;
-
-    // Fluid interaction tracking
-    private Vector2 velocityBuffer;
-    private bool wasInFluid;
-    private float fluidImpactForce;
-    private bool isInFluid;
-    private float timeInFluid;
-
-    private bool isFluidPulling;
-    private bool isFluidPushing;
-    private float fluidControlStrength;
 
 #if UNITY_6000_0_OR_NEWER
     private Vector2 BodyVelocity
@@ -129,9 +111,11 @@ public class PlayerManager : MonoBehaviour
     {
         rb = GetComponent<Rigidbody2D>();
         sr = GetComponent<SpriteRenderer>();
-        cc = GetComponent<CapsuleCollider2D>();
+        playerCollider = GetComponent<Collider2D>();
+        water = GetComponent<PlayerWaterInteraction>();
+        // Draw on top of terrain (Background) and other 2D so we don't vanish when moving left
         sr.sortingLayerName = "Characters";
-        sr.sortingOrder = 100;
+        sr.sortingOrder = 32767;
         invertedSpaceLayer = LayerMask.NameToLayer("InvertedSpace");
         solidLayerMask = solidLayer;
         normalState = new NormalState(this);
@@ -143,10 +127,10 @@ public class PlayerManager : MonoBehaviour
         TransitionTo(normalState);
 
         lastPosition = transform.position;
-        if (fluidSim == null)
-        {
-            fluidSim = FindFirstObjectByType<FluidSim2D>();
-        }
+
+        // Initialize jump timers so we don't trigger a jump on the very first frame
+        lastGroundedTime = coyoteTime + 1f;
+        lastJumpPressedTime = jumpBufferTime + 1f;
     }
 
     void OnEnable() => actions?.Enable();
@@ -161,81 +145,54 @@ public class PlayerManager : MonoBehaviour
         HandleSpaceTransitions();
 
         currentState.HandleUpdate();
-        CheckFluidInteraction();
+        water?.Tick();
 
-        // NEW: Add this line to ensure fluid interaction is always updated
-        // (This provides a fallback in case states don't call it)
-        if (!currentState.GetType().Name.Contains("State"))
-        {
-            HandleFluidInteraction(); // Fallback call
-        }
+        // Track coyote-time window
+        lastGroundedTime = isGrounded ? 0f : lastGroundedTime + Time.deltaTime;
+        // Track jump-buffer window
+        if (Input.GetKeyDown(KeyCode.Space))
+            lastJumpPressedTime = 0f;
+        else
+            lastJumpPressedTime += Time.deltaTime;
+        // Variable jump cut: apply when space released and still moving up
+        if (Input.GetKeyUp(KeyCode.Space) && BodyVelocity.y > 0f)
+            BodyVelocity = new Vector2(BodyVelocity.x, BodyVelocity.y * jumpCutMultiplier);
+
     }
 
     void FixedUpdate()
     {
         currentState.HandleFixedUpdate();
-        UpdateVelocityTracking();
+        water?.UpdateVelocityTracking();
     }
 
     // === Space Detection System ===
+    // InvertedSpace geometry comes from SplineShapeGenerator_InvertedSpace: closed splines
+    // become a CompositeCollider2D on the "InvertedSpace" layer. We differentiate:
+    // - Free movement in level: Normal state, no overlap with InvertedSpace required.
+    // - Moving inside InvertedSpace: Mirrored state only (entered via E when grounded and
+    //   raycast hits InvertedSpace). Entry/exit use that layer for raycasts and ground checks.
     private SpaceType DetectCurrentSpace()
     {
-        Vector2 playerPos = transform.position;
-
-        // Check inverted space first so we can still invert even when there's fluid inside it
-        if (IsInValidInvertedSpace())
+        // Inversion is manual (E key). Space type = current state:
+        // Mirrored => InvertedSpace, else Fluid if in water, else Normal.
+        if (currentState == mirroredState)
         {
             return SpaceType.InvertedSpace;
         }
 
-        // Fluid affects movement but should not block inverted-space detection
-        if (IsInFluid())
+        if (water != null && water.IsInFluid)
         {
             return SpaceType.Fluid;
         }
 
-        // Default to normal space
         return SpaceType.Normal;
-    }
-
-    private bool IsInValidInvertedSpace()
-    {
-        Vector2 playerPos = transform.position;
-
-        // Basic overlap check
-        Collider2D invertedSpaceCollider = Physics2D.OverlapCircle(
-            playerPos,
-            spaceCheckRadius,
-            1 << invertedSpaceLayer
-        );
-
-        if (invertedSpaceCollider == null)
-            return false;
-
-        // If we're already in mirrored state, allow staying in inverted space
-        // but check if we should exit based on grounded status
-        if (currentState == mirroredState)
-        {
-            // If we require grounded for inversion, check if we're grounded in inverted space
-            if (requireGroundedForInversion)
-            {
-                bool isGroundedInInvertedSpace = CheckMirroredGrounded();
-
-                // Stay in inverted space only if we're grounded in it OR we're transitioning
-                return isGroundedInInvertedSpace || isTransitioning;
-            }
-            return true;
-        }
-
-        // We're inside inverted space; automatic detection should not enforce entry rules.
-        // Validation is handled explicitly for manual flips.
-        return true;
     }
 
     private bool ValidateInvertedSpaceEntry(Vector2 playerPos)
     {
         // First check if we're in fluid - prevent inversion in fluid
-        if (preventInversionInFluid && IsInFluid())
+        if (preventInversionInFluid && water != null && water.IsInFluid)
         {
             Debug.Log("Inverted space entry blocked - cannot invert while in fluid");
             return false;
@@ -245,7 +202,6 @@ public class PlayerManager : MonoBehaviour
         if (requireGroundedForInversion)
         {
             // Consider both normal ground and inverted-space ground as valid.
-            CheckGrounded();
             bool groundedNormal = isGrounded;
             bool groundedInverted = CheckMirroredGrounded();
             if (!groundedNormal && !groundedInverted)
@@ -389,51 +345,57 @@ public class PlayerManager : MonoBehaviour
         isTransitioning = true;
     }
 
+    /// <summary>
+    /// Simple entry: look straight above/below the player for InvertedSpace
+    /// and enter there. This is more forgiving than the side-entry logic and
+    /// matches the behaviour you expect when standing where you want to invert.
+    /// </summary>
     private bool TryEnterInvertedSpaceImproved()
     {
         // Check fluid restriction first
-        if (preventInversionInFluid && IsInFluid())
+        if (preventInversionInFluid && water != null && water.IsInFluid)
         {
             Debug.Log("Cannot enter inverted space - in fluid");
             return false;
         }
-
         // Check grounded requirement
         if (requireGroundedForInversion)
         {
-            CheckGrounded();
             if (!isGrounded)
             {
                 Debug.Log("Cannot enter inverted space - not grounded");
                 return false;
             }
         }
-
-        Vector2 fromPos = transform.position;
-        EntryInfo entryInfo = FindBestEntryPoint(fromPos);
-
-        if (!entryInfo.isValid)
+        float maxDist = detectionRadius > 0 ? detectionRadius : 2f;
+        Vector2 origin = transform.position;
+        LayerMask invertedMask = 1 << invertedSpaceLayer;
+        // Prefer a hit directly below (standing on inverted floor), else above (ceiling).
+        RaycastHit2D hitDown = Physics2D.Raycast(origin, Vector2.down, maxDist, invertedMask);
+        RaycastHit2D hitUp = hitDown.collider == null
+            ? Physics2D.Raycast(origin, Vector2.up, maxDist, invertedMask)
+            : default;
+        RaycastHit2D hit = hitDown.collider != null ? hitDown : hitUp;
+        if (hit.collider == null)
         {
-            Debug.Log("No valid inverted space entry point found");
+            Debug.Log("No valid inverted space entry point found (no InvertedSpace above/below player)");
             return false;
         }
-
         // Store entry information
-        entryPoint = fromPos;
-        currentNormal = entryInfo.normal;
-
-        // Place the player just inside inverted space, slightly off the boundary,
-        // and clear any previous velocity so we don't get catapulted by physics.
+        entryPoint = origin;
+        currentNormal = hit.normal;
+        // Place the player fully inside inverted space using collider height,
+        // so the "feet" side isn't glued to the world-space edge, and clear velocity.
         if (snapToValidPosition)
         {
-            const float entryOffset = 0.05f;
-            Vector2 targetPos = entryInfo.position - entryInfo.normal * entryOffset;
+            float halfHeight = playerCollider.bounds.extents.y;
+            float entryOffset = 0.05f;
+            Vector2 targetPos = hit.point - hit.normal * (halfHeight + entryOffset);
             rb.position = targetPos;
             rb.velocity = Vector2.zero;
             rb.angularVelocity = 0f;
         }
-
-        Debug.Log($"Entering inverted space with quality {entryInfo.quality:F2}, normal {entryInfo.normal}, grounded: {isGrounded}");
+        Debug.Log($"Entering inverted space at {hit.point}, normal {hit.normal}, grounded: {isGrounded}");
         return true;
     }
 
@@ -458,14 +420,17 @@ public class PlayerManager : MonoBehaviour
         }
         else
         {
-            // Exit to normal space regardless of grounded status to avoid getting stuck.
+            // Exit: transition first (restore scale + gravity), then teleport to entry.
             Vector2 exitPos = FindExitPoint();
-            transform.position = exitPos;
+            Debug.Log($"Exiting inverted space to entryPoint ({exitPos.x:F2}, {exitPos.y:F2})");
             TransitionTo(normalState);
+            rb.position = exitPos;
+            rb.velocity = Vector2.zero;
+            rb.angularVelocity = 0f;
+            transform.position = exitPos;
         }
 
-        // Create a small splash effect when manually flipping
-        CreateSplashEffect();
+        // Optional: splash visual now handled by PlayerWaterInteraction if desired
     }
 
     private bool TryFindNearbyInvertedSpace(out Vector2 entryPos, out Vector2 normal)
@@ -492,87 +457,20 @@ public class PlayerManager : MonoBehaviour
         currentState.Enter();
     }
 
-    public bool IsInMirroredState()
+    public bool IsInMirroredState() => currentState == mirroredState;
+
+    public float MoveSpeedForFluidControl => moveSpeed;
+
+    public Vector2 LastPosition
     {
-        return currentState == mirroredState;
+        get => lastPosition;
+        set => lastPosition = value;
     }
 
     public bool CanFlip() => Time.time - lastFlipTime >= flipCooldown;
 
     public SpaceType GetCurrentSpaceType() => currentSpaceType;
     public bool IsTransitioning() => isTransitioning;
-
-    // === Fluid Interaction (keeping your existing system) ===
-    void UpdateVelocityTracking()
-    {
-        Vector2 currentPos = transform.position;
-        velocityBuffer = (currentPos - lastPosition) / Time.fixedDeltaTime;
-        lastPosition = currentPos;
-    }
-
-    void CheckFluidInteraction()
-    {
-        if (!enableFluidInteraction) return;
-
-        bool wasInFluidPreviously = isInFluid;
-        isInFluid = IsInFluid();
-
-        if (isInFluid)
-        {
-            timeInFluid += Time.deltaTime;
-
-            // Create splash effect when entering fluid or moving fast
-            if ((!wasInFluidPreviously && rb.velocity.magnitude > splashThreshold) ||
-                (Time.time - lastSplashTime > 1f && rb.velocity.magnitude > splashThreshold * 1.5f))
-            {
-                CreateSplashEffect();
-                lastSplashTime = Time.time;
-            }
-
-            // NEW: Debug output for particle-based fluid detection
-            if (fluidSim != null && Time.frameCount % 60 == 0) // Every second
-            {
-                Debug.Log($"Player in fluid - Nearby particles: {fluidSim.GetNearbyParticleCount()}, " +
-                         $"Submersion depth: {fluidSim.GetPlayerSubmersionDepth():F2}");
-            }
-        }
-        else
-        {
-            timeInFluid = 0f;
-        }
-
-        wasInFluid = isInFluid;
-    }
-
-    bool IsInFluid()
-    {
-        // NEW: Use FluidSim2D's particle-based detection
-        if (fluidSim != null)
-        {
-            return fluidSim.IsPlayerInFluid();
-        }
-
-        // FALLBACK: Old proximity-based detection for other fluid objects
-        Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(transform.position, fluidPushRadius);
-        foreach (var collider in nearbyColliders)
-        {
-            if (collider.CompareTag("Fluid") || collider.name.Contains("Particle"))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    void CreateSplashEffect()
-    {
-        if (splashEffect != null && Time.time - lastSplashTime > 0.5f)
-        {
-            splashEffect.transform.position = transform.position;
-            splashEffect.Play();
-        }
-    }
 
     // === Movement Property Getters ===
     public Vector2 GetVelocity() => BodyVelocity;
@@ -584,47 +482,23 @@ public class PlayerManager : MonoBehaviour
 
     public float GetCurrentMoveSpeed()
     {
-        if (IsInFluid())
-        {
-            // NEW: Scale movement based on submersion depth
-            float submersion = GetFluidSubmersionLevel();
-            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
-            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
-
-            // More submersion = more movement reduction
-            float fluidModifier = Mathf.Lerp(1f, fluidMoveSpeedMultiplier, submersionRatio);
-            return moveSpeed * fluidModifier;
-        }
-        return moveSpeed;
+        return water != null ? water.ModifyMoveSpeed(moveSpeed) : moveSpeed;
     }
 
     public float GetCurrentJumpForce()
     {
-        if (IsInFluid())
-        {
-            // NEW: Scale jump based on submersion depth
-            float submersion = GetFluidSubmersionLevel();
-            float maxSubmersion = fluidSim?.maxBuoyancyDepth ?? 3f;
-            float submersionRatio = Mathf.Clamp01(submersion / maxSubmersion);
-
-            // More submersion = more jump boost
-            float fluidModifier = Mathf.Lerp(1f, fluidJumpMultiplier, submersionRatio);
-            return jumpForce * fluidModifier;
-        }
-        return jumpForce;
+        return water != null ? water.ModifyJumpForce(jumpForce) : jumpForce;
     }
 
     public bool CanSwim()
     {
-        if (!IsInFluid()) return false;
+        if (water == null || !water.IsInFluid) return false;
 
-        // NEW: Require minimum submersion to swim
-        float submersion = GetFluidSubmersionLevel();
-        float minSubmersionForSwimming = 0.5f; // Minimum depth needed to swim
+        // Require minimum submersion to swim
+        float submersion = water.SubmersionDepth;
+        float minSubmersionForSwimming = 0.5f;
 
-        return submersion >= minSubmersionForSwimming &&
-               IsInMirroredState() &&
-               canSwimInMirroredState;
+        return submersion >= minSubmersionForSwimming && IsInMirroredState();
     }
 
     // === State Interface ===
@@ -658,6 +532,10 @@ public class PlayerManager : MonoBehaviour
         {
             pm.rb.gravityScale = 1;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.invertedSpaceLayer, false);
+            // Ensure scale is upright in normal space
+            Vector3 s = pm.transform.localScale;
+            s.y = Mathf.Abs(s.y);
+            pm.transform.localScale = s;
 
             // Smooth transition to upright
             if (pm.maintainUpright)
@@ -679,20 +557,8 @@ public class PlayerManager : MonoBehaviour
 
             if (Input.GetKeyDown(KeyCode.Space))
             {
-                if (pm.isGrounded || (pm.isInFluid && pm.timeInFluid > 0.1f))
-                {
-                    float jumpForce = pm.GetCurrentJumpForce();
-                    pm.BodyVelocity = new Vector2(pm.BodyVelocity.x, jumpForce);
-
-                    if (pm.isInFluid)
-                    {
-                        pm.CreateSplashEffect();
-                    }
-                }
+                // handled in outer Update via jumpBufferTime; nothing here
             }
-
-            // NEW: Add fluid interaction handling
-            pm.HandleFluidInteraction();
 
             HandlePushInteraction();
         }
@@ -700,10 +566,30 @@ public class PlayerManager : MonoBehaviour
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
-            float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.BodyVelocity = new Vector2(input.x * currentMoveSpeed, pm.BodyVelocity.y);
 
-            // In normal space, align to the regular ground under the player.
+            // 1) Horizontal accel/decel (same feel as mirrored state)
+            float targetSpeed = input.x * pm.maxMoveSpeed;
+            float speedDiff = targetSpeed - pm.currentXSpeed;
+            float accelRate = Mathf.Abs(targetSpeed) > Mathf.Abs(pm.currentXSpeed)
+                ? pm.accel
+                : pm.decel;
+            pm.currentXSpeed += speedDiff * accelRate * Time.fixedDeltaTime;
+            pm.BodyVelocity = new Vector2(pm.currentXSpeed, pm.BodyVelocity.y);
+
+            // 2) Jump (coyote + buffer)
+            bool canCoyote = pm.lastGroundedTime <= pm.coyoteTime;
+            bool hasBufferedJump = pm.lastJumpPressedTime <= pm.jumpBufferTime;
+            if (canCoyote && hasBufferedJump)
+            {
+                float jumpForce = pm.GetCurrentJumpForce();
+                pm.BodyVelocity = new Vector2(pm.BodyVelocity.x, jumpForce);
+
+                // consume buffers
+                pm.lastGroundedTime = pm.coyoteTime + 1f;
+                pm.lastJumpPressedTime = pm.jumpBufferTime + 1f;
+            }
+
+            // 3) Ground-aligned rotation & color
             if (pm.maintainUpright)
             {
                 Vector2 groundNormal = pm.DetectGroundNormal();
@@ -748,12 +634,11 @@ public class PlayerManager : MonoBehaviour
             pm.rb.gravityScale = -1f;
             pm.BodyVelocity = Vector2.zero;
             Physics2D.IgnoreLayerCollision(pm.gameObject.layer, pm.invertedSpaceLayer, false);
-
-            // Smooth transition to inverted
-            if (pm.maintainUpright)
-            {
-                pm.StartCoroutine(pm.SmoothRotationTransition(Quaternion.Euler(0, 0, 180)));
-            }
+            // Flip vertically via scale so the character appears
+            // upside‑down while colliders stay consistent.
+            Vector3 s = pm.transform.localScale;
+            s.y = -Mathf.Abs(s.y);
+            pm.transform.localScale = s;
 
             Debug.Log("Player entered mirrored state");
         }
@@ -778,63 +663,37 @@ public class PlayerManager : MonoBehaviour
                     float jumpForce = pm.GetCurrentJumpForce();
                     Vector2 jumpDirection = pm.CanSwim() ? Vector2.up : Vector2.down;
                     pm.BodyVelocity = new Vector2(pm.BodyVelocity.x, jumpDirection.y * jumpForce);
-
-                    if (pm.isInFluid)
-                    {
-                        pm.CreateSplashEffect();
-                    }
                 }
             }
-
-            // NEW: Add fluid interaction handling
-            pm.HandleFluidInteraction();
         }
 
         public void HandleFixedUpdate()
         {
             input.x = Input.GetAxisRaw("Horizontal");
-            float currentMoveSpeed = pm.GetCurrentMoveSpeed();
-            pm.BodyVelocity = new Vector2(input.x * currentMoveSpeed, pm.BodyVelocity.y);
-
-            if (pm.CanSwim())
+            // 1) Horizontal accel/decel
+            float targetSpeed = input.x * pm.maxMoveSpeed;
+            float speedDiff = targetSpeed - pm.currentXSpeed;
+            float accelRate = Mathf.Abs(targetSpeed) > Mathf.Abs(pm.currentXSpeed)
+                ? pm.accel
+                : pm.decel;
+            pm.currentXSpeed += speedDiff * accelRate * Time.fixedDeltaTime;
+            pm.BodyVelocity = new Vector2(pm.currentXSpeed, pm.BodyVelocity.y);
+            // 2) Jump (coyote + buffer)
+            bool canCoyote = pm.lastGroundedTime <= pm.coyoteTime;
+            bool hasBufferedJump = pm.lastJumpPressedTime <= pm.jumpBufferTime;
+            if (canCoyote && hasBufferedJump)
             {
-                // In fluid, keep upright to world up if you prefer
-                pm.transform.rotation = Quaternion.Slerp(
-                    pm.transform.rotation,
-                    Quaternion.Euler(0, 0, 0),
-                    Time.deltaTime * pm.rotationSpeed
-                );
+                float jumpForce = pm.GetCurrentJumpForce();
+                pm.BodyVelocity = new Vector2(pm.BodyVelocity.x, jumpForce);
+                // consume buffers
+                pm.lastGroundedTime = pm.coyoteTime + 1f;
+                pm.lastJumpPressedTime = pm.jumpBufferTime + 1f;
             }
-            else if (pm.maintainUpright)
-            {
-                // On inverted ground, align to the inverted ground normal
-                Vector2 invertedNormal = pm.DetectInvertedGroundNormal();
-                pm.RotateToMatchNormal(invertedNormal);
-            }
-
-            pm.sr.color = Color.Lerp(pm.sr.color, pm.mirroredColor, Time.deltaTime * 10f);
+            // 3) Color only (no extra rotation in mirrored space)
+            pm.sr.color = Color.Lerp(pm.sr.color, pm.normalColor, Time.deltaTime * 10f);
         }
 
-        private void HandlePlayerFluidControls()
-        {
-            pm.HandleFluidInteraction();
-
-            // Optional: Visual feedback for fluid control
-            if (pm.IsPlayerControllingFluid())
-            {
-                // You could add particle effects, screen shake, or other feedback here
-                if (pm.isFluidPulling)
-                {
-                    // Visual feedback for pulling
-                    Debug.Log("Player pulling fluid");
-                }
-                else if (pm.isFluidPushing)
-                {
-                    // Visual feedback for pushing  
-                    Debug.Log("Player pushing fluid");
-                }
-            }
-        }
+        // Fluid control visuals are now handled by PlayerWaterInteraction if needed
     }
 
     // === Helper Coroutines ===
@@ -858,14 +717,14 @@ public class PlayerManager : MonoBehaviour
     // === Utility Functions (keeping your existing ones) ===
     private bool CheckMirroredGrounded()
     {
-        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.up, 0.2f, 1 << invertedSpaceLayer);
+        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.up, groundCheckDistance, 1 << invertedSpaceLayer);
         bool isOnInvertedSpace = hit.collider != null;
         return isOnInvertedSpace;
     }
 
     private void CheckGrounded()
     {
-        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.down, 0.2f, solidLayerMask);
+        RaycastHit2D hit = Physics2D.Raycast(groundChecker.position, Vector2.down, groundCheckDistance, solidLayerMask);
         isGrounded = hit.collider != null;
     }
 
@@ -884,170 +743,149 @@ public class PlayerManager : MonoBehaviour
                                              Time.deltaTime * rotationSpeed);
     }
 
+    /// <summary>
+    /// Exit inverted space: place the player at the mirrored position across the boundary
+    /// (same as the gizmo capsule), so they land in the corresponding spot on the normal side.
+    /// Falls back to entryPoint if the boundary can't be found.
+    /// </summary>
     private Vector2 FindExitPoint()
     {
-        // Find nearest normal space
-        Collider2D[] nearbyColliders = Physics2D.OverlapCircleAll(
-            transform.position,
-            detectionRadius,
-            normalSpaceLayer
-        );
-
-        if (nearbyColliders.Length > 0)
+        if (TryGetBoundaryHit(out Vector2 boundaryPoint, out Vector2 boundaryNormal))
         {
-            // Find the closest normal space
-            float closestDist = Mathf.Infinity;
-            Vector2 closestPoint = transform.position;
-
-            foreach (var collider in nearbyColliders)
-            {
-                Vector2 point = collider.ClosestPoint(transform.position);
-                float dist = Vector2.Distance(transform.position, point);
-
-                if (dist < closestDist)
-                {
-                    closestDist = dist;
-                    closestPoint = point + (Vector2)(transform.position - (Vector3)point).normalized * edgeFollowDistance;
-                }
-            }
-
-            return closestPoint;
+            return ReflectPointAcrossBoundary(transform.position, boundaryPoint, boundaryNormal);
         }
-
-        // Fallback: move up and out
-        return transform.position + Vector3.up * edgeFollowDistance * 2f;
+        return entryPoint;
     }
 
     public bool IsInFluidArea()
     {
-        return IsInFluid();
+        return water != null && water.IsInFluid;
     }
 
     public float GetFluidSubmersionLevel()
     {
-        if (fluidSim != null)
-        {
-            return fluidSim.GetPlayerSubmersionDepth();
-        }
-        return 0f;
+        return water != null ? water.SubmersionDepth : 0f;
     }
 
     public int GetNearbyFluidParticleCount()
     {
-        if (fluidSim != null)
-        {
-            return fluidSim.GetNearbyParticleCount();
-        }
-        return 0;
+        return water != null ? water.NearbyParticleCount : 0;
     }
 
-    private void HandleFluidInteraction()
-    {
-        if (!enablePlayerFluidControl || !enableFluidInteraction)
-        {
-            isFluidPulling = false;
-            isFluidPushing = false;
-            fluidControlStrength = 0f;
-            return;
-        }
-
-        // Check if player is near fluid (if required)
-        if (requireFluidProximityForControl)
-        {
-            bool nearFluid = false;
-
-            if (fluidSim != null)
-            {
-                // Check if player is within control proximity of fluid
-                Vector2 playerPos = transform.position;
-
-                // Use the cached particle positions from FluidSim2D if available
-                if (fluidSim.positionBuffer != null && fluidSim.numParticles > 0)
-                {
-                    // We'll check this through the fluid sim's existing methods
-                    nearFluid = IsInFluid() || GetDistanceToNearestFluidParticle() <= fluidControlProximityRadius;
-                }
-            }
-
-            if (!nearFluid)
-            {
-                isFluidPulling = false;
-                isFluidPushing = false;
-                fluidControlStrength = 0f;
-                return;
-            }
-        }
-
-        // Handle input
-        isFluidPulling = Input.GetKey(fluidPullKey);
-        isFluidPushing = Input.GetKey(fluidPushKey);
-
-        // Calculate interaction strength
-        if (isFluidPushing || isFluidPulling)
-        {
-            fluidControlStrength = isFluidPushing ? -playerFluidInteractionStrength : playerFluidInteractionStrength;
-
-            // Modify strength based on player state
-            if (IsInMirroredState())
-            {
-                fluidControlStrength *= 1.3f; // Stronger interaction in mirrored state
-            }
-
-            // Reduce strength if player is moving fast to prevent overpowered effects
-            float movementFactor = Mathf.Clamp01(2f - (rb.velocity.magnitude / moveSpeed));
-            fluidControlStrength *= movementFactor;
-        }
-        else
-        {
-            fluidControlStrength = 0f;
-        }
-    }
-
-    // Add this helper method:
-    private float GetDistanceToNearestFluidParticle()
-    {
-        if (fluidSim == null) return float.MaxValue;
-
-        // This is a simplified check - in a full implementation, you'd want to 
-        // check against actual particle positions, but this gives a reasonable approximation
-        Vector2 playerPos = transform.position;
-
-        // Check if we're in the general fluid area
-        if (fluidSim.IsPlayerInFluid())
-        {
-            return 0f; // Already in fluid
-        }
-
-        // For now, return a reasonable estimate based on fluid detection radius
-        return fluidSim.fluidDetectionRadius;
-    }
-
-    // Add these public methods for FluidSim2D to query:
+    // Public wrappers for FluidSim2D / other systems to query water-control info via PlayerManager
     public bool IsPlayerControllingFluid()
     {
-        return enablePlayerFluidControl && (isFluidPulling || isFluidPushing);
+        return water != null && water.IsControllingFluid;
     }
 
     public float GetPlayerFluidControlStrength()
     {
-        return fluidControlStrength;
+        return water != null ? water.ControlStrength : 0f;
     }
 
     public float GetPlayerFluidControlRadius()
     {
-        return playerFluidInteractionRadius;
+        return water != null ? water.ControlRadius : 0f;
     }
 
     public Vector2 GetPlayerFluidControlPosition()
     {
-        return transform.position;
+        return water != null ? water.ControlPosition : (Vector2)transform.position;
     }
 
     public float GetCurrentPlayerInteractionStrength()
     {
-        return playerFluidInteractionStrength;
+        return water != null ? water.BaseInteractionStrength : 0f;
     }
 
+    /// <summary>
+    /// Raycast to the InvertedSpace boundary from the current position (down when mirrored, up when normal).
+    /// Returns true and the hit point/normal if we hit the boundary.
+    /// </summary>
+    public bool TryGetBoundaryHit(out Vector2 boundaryPoint, out Vector2 boundaryNormal)
+    {
+        boundaryPoint = Vector2.zero;
+        boundaryNormal = Vector2.zero;
+        float maxDist = detectionRadius > 0 ? detectionRadius : 4f;
+        Vector2 origin = transform.position;
+        LayerMask invertedMask = 1 << invertedSpaceLayer;
+
+        // When mirrored we're on the ceiling → raycast down. When normal we're below → raycast up.
+        Vector2 primaryDir = currentState == mirroredState ? Vector2.down : Vector2.up;
+        RaycastHit2D hit = Physics2D.Raycast(origin, primaryDir, maxDist, invertedMask);
+        if (hit.collider == null)
+            hit = Physics2D.Raycast(origin, -primaryDir, maxDist, invertedMask);
+
+        if (hit.collider == null)
+            return false;
+
+        boundaryPoint = hit.point;
+        boundaryNormal = hit.normal;
+        return true;
+    }
+
+    /// <summary>
+    /// Reflect a point across the boundary line (point B, normal N). Returns the mirrored position.
+    /// </summary>
+    public static Vector2 ReflectPointAcrossBoundary(Vector2 point, Vector2 boundaryPoint, Vector2 boundaryNormal)
+    {
+        Vector2 n = boundaryNormal.sqrMagnitude > 0.001f ? boundaryNormal.normalized : boundaryNormal;
+        float d = Vector2.Dot(point - boundaryPoint, n);
+        return point - 2f * d * n;
+    }
+
+    /// <summary>
+    /// Get capsule dimensions from the player collider for gizmos/positioning (half-height and radius).
+    /// </summary>
+    public void GetCapsuleSize(out float halfHeight, out float radius)
+    {
+        if (playerCollider == null)
+        {
+            halfHeight = 0.5f;
+            radius = 0.25f;
+            return;
+        }
+
+        var cap = playerCollider as CapsuleCollider2D;
+        if (cap != null)
+        {
+            float w = cap.size.x * 0.5f;
+            float h = cap.size.y * 0.5f;
+            if (cap.direction == CapsuleDirection2D.Vertical)
+            {
+                radius = w;
+                halfHeight = h;
+            }
+            else
+            {
+                radius = h;
+                halfHeight = w;
+            }
+            // Scale by transform
+            halfHeight *= Mathf.Abs(transform.lossyScale.y);
+            radius *= Mathf.Abs(transform.lossyScale.x);
+            return;
+        }
+
+        Bounds b = playerCollider.bounds;
+        halfHeight = b.extents.y;
+        radius = b.extents.x;
+    }
+
+    /// <summary>
+    /// Draw a vertical capsule outline in the XY plane (for 2D gizmo).
+    /// </summary>
+    private static void DrawCapsuleGizmo(Vector2 center, float halfHeight, float radius)
+    {
+        float cylinderHalf = Mathf.Max(0f, halfHeight - radius);
+        Vector3 topCenter = new Vector3(center.x, center.y + cylinderHalf, 0f);
+        Vector3 bottomCenter = new Vector3(center.x, center.y - cylinderHalf, 0f);
+
+        Gizmos.DrawWireSphere(topCenter, radius);
+        Gizmos.DrawWireSphere(bottomCenter, radius);
+        Gizmos.DrawLine(new Vector3(center.x - radius, topCenter.y, 0f), new Vector3(center.x - radius, bottomCenter.y, 0f));
+        Gizmos.DrawLine(new Vector3(center.x + radius, topCenter.y, 0f), new Vector3(center.x + radius, bottomCenter.y, 0f));
+    }
 
 void OnDrawGizmosSelected()
     {
@@ -1061,6 +899,21 @@ void OnDrawGizmosSelected()
         // Detection radius
         Gizmos.color = Color.gray;
         Gizmos.DrawWireSphere(transform.position, detectionRadius);
+
+        // Mirrored capsule: same size as player, on the other side of the InvertedSpace boundary
+        if (TryGetBoundaryHit(out Vector2 boundaryPoint, out Vector2 boundaryNormal))
+        {
+            Vector2 mirroredPos = ReflectPointAcrossBoundary(transform.position, boundaryPoint, boundaryNormal);
+            GetCapsuleSize(out float halfHeight, out float radius);
+
+            Gizmos.color = Color.cyan;
+            DrawCapsuleGizmo(mirroredPos, halfHeight, radius);
+
+            // Boundary point and normal for reference
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(boundaryPoint, 0.08f);
+            Gizmos.DrawLine(boundaryPoint, boundaryPoint + boundaryNormal * 0.5f);
+        }
 
         // Draw entry validation rays if restricting side entry
         if (restrictSideEntry)
@@ -1093,20 +946,6 @@ void OnDrawGizmosSelected()
                 Gizmos.color = Color.cyan;
                 Gizmos.DrawSphere(bestEntry.position, 0.1f);
                 Gizmos.DrawLine(transform.position, bestEntry.position);
-            }
-        }
-
-        // Fluid interaction radius
-        if (enableFluidInteraction)
-        {
-            Gizmos.color = IsInMirroredState() ?
-                new Color(1, 0, 1, 0.3f) : new Color(0, 1, 1, 0.3f);
-            Gizmos.DrawWireSphere(transform.position, fluidPushRadius);
-
-            if (isInFluid)
-            {
-                Gizmos.color = Color.blue;
-                Gizmos.DrawWireCube(transform.position + Vector3.up, Vector3.one * 0.3f);
             }
         }
 

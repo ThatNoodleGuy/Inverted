@@ -6,6 +6,13 @@ using UnityEngine;
 using UnityEngine.Splines;
 using Unity.Mathematics;
 
+/// <summary>
+/// Builds InvertedSpace geometry from splines: closed splines become polygon colliders
+/// merged into a single CompositeCollider2D on this GameObject. This GameObject must
+/// be on the "InvertedSpace" layer so PlayerManager can detect entry/exit (raycasts
+/// and ground checks use that layer). Differentiates from normal level movement:
+/// player is "inside" InvertedSpace only when in mirrored state (manual flip).
+/// </summary>
 [RequireComponent(typeof(Rigidbody2D))]
 public class SplineShapeGenerator_InvertedSpace : MonoBehaviour
 {
@@ -118,6 +125,10 @@ public class SplineShapeGenerator_InvertedSpace : MonoBehaviour
             if (colorComponent != null)
                 DestroyImmediate(colorComponent);
         }
+
+        // Ensure this GameObject (parent of all spline shapes) is on InvertedSpace layer
+        // so the composite collider is detected by PlayerManager raycasts/overlaps.
+        gameObject.layer = LayerMask.NameToLayer("InvertedSpace");
 
         // Setup Rigidbody2D
         Rigidbody2D rb = GetComponent<Rigidbody2D>();

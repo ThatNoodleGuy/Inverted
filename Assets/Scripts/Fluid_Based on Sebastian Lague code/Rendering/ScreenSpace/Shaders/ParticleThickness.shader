@@ -16,7 +16,8 @@ Shader "Fluid/ParticleThickness" {
 			#pragma target 4.5
 			#include "UnityCG.cginc"
 			
-			StructuredBuffer<float3> Positions;
+			// 2D positions from FluidSim2D (z reconstructed as 0 in world space)
+			StructuredBuffer<float2> Positions;
 			float scale;
 
 			struct v2f
@@ -29,7 +30,8 @@ Shader "Fluid/ParticleThickness" {
 			{
 				v2f o;
 				
-				float3 worldCentre = Positions[instanceID];
+				float2 pos2D = Positions[instanceID];
+				float3 worldCentre = float3(pos2D.x, pos2D.y, 0);
 				float3 vertOffset = v.vertex * scale * 2;
 				float3 camUp = unity_CameraToWorld._m01_m11_m21;
 				float3 camRight = unity_CameraToWorld._m00_m10_m20;
